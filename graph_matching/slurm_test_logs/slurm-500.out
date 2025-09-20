@@ -1,0 +1,10 @@
+Directory ready: /fs/gpfs41/lv11/fileset01/pool/pool-smola/full_worms_500
+Directory ready: /fs/gpfs41/lv11/fileset01/pool/pool-smola/full_worms_500/dd_files
+Directory ready: /fs/gpfs41/lv11/fileset01/pool/pool-smola/full_worms_500/solutions
+Directory ready: /fs/gpfs41/lv11/fileset01/pool/pool-smola/full_worms_500/matches
+Directory ready: /fs/gpfs41/lv11/fileset01/pool/pool-smola/full_worms_500/keys
+Directory ready: /fs/gpfs41/lv11/fileset01/pool/pool-smola/full_worms_500/atlas_pickle
+500 0.910622 0.043330 0.740000 0.986000 5496.46
+Subgraph size: 500
+Mean accuracy: 0.910622
+Total time taken: 5496.46 seconds
