@@ -4,11 +4,12 @@ import pytorch_lightning as L
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
 from torch.optim.lr_scheduler import LambdaLR
-from typing import Dict, Optional, Any
+from typing import Dict, Any
 import math
 
-from loader.node_dropping import CurriculumNodeDropper
 from loader.graph_encoder import GraphEncoder
+from loader.coordinate_encoder import CoordinateEncoder
+from loader.cell_types import NUM_CELL_TYPES
 from model.model import Wormologist
 from model.pe import PEModule
 from model.multiscale_pe import MultiScaleRRWPFiltration
@@ -29,11 +30,6 @@ class LightningModel(L.LightningModule):
         # Track global batch counter for curriculum learning
         self.global_batch_counter = 0
         
-        # Node dropper for calculating visibility rates (if curriculum enabled)
-        self.node_dropper = None
-        if config.curriculum.enabled:
-            self.node_dropper = CurriculumNodeDropper(config.curriculum)
-        
         # Initialize PE modules based on config
         if config.model.use_multiscale_pe:
             self.pe_module = MultiScaleRRWPFiltration(
@@ -50,15 +46,11 @@ class LightningModel(L.LightningModule):
             pe_node_dim = config.model.k_hops
             pe_edge_dim = config.model.k_hops
         
-        # Determine base input dimensions based on coordinate system
-        if config.data.coordinate_system == "cylindrical":
-            base_input_dim = 4  # sin(theta), cos(theta), radius, z
-        else:
-            base_input_dim = 3  # x, y, z
+        base_input_dim = CoordinateEncoder.get_output_dim(config.data.coordinate_system)
         
         # Add cell type feature dimensions if enabled
         if config.data.use_cell_type_features:
-            base_input_dim += 7  # 7 cell types (one-hot encoded)
+            base_input_dim += NUM_CELL_TYPES  # One-hot encoded cell types
         
         node_input_dim = base_input_dim + pe_node_dim
         
@@ -86,8 +78,10 @@ class LightningModel(L.LightningModule):
         self.matcher = self.loss_fn.matcher
     
     
-    def forward(self, coords: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor, batch: Optional[torch.Tensor] = None) -> Dict:
-        return self.model(coords, edge_index, edge_attr, batch)
+    def forward(self, batch: Dict) -> Dict:
+        """Forward pass accepting batch dict from data loader or inference."""
+        coords, edge_index, edge_attr, batch_assignment, _ = self.preprocess_batch(batch)
+        return self.model(coords, edge_index, edge_attr, batch_assignment)
     
     
     def preprocess_batch(self, batch_data: Dict) -> tuple:
@@ -160,9 +154,13 @@ class LightningModel(L.LightningModule):
     
     
     def _process_batch(self, batch: Dict):
-        coords, edge_index, edge_attr, batch_assignment, labels = self.preprocess_batch(batch)
-        outputs = self.model(coords, edge_index, edge_attr, batch_assignment)
+        outputs = self(batch)
+        
+        pyg_batch = batch['batch']
+        labels = pyg_batch.y
+        batch_assignment = pyg_batch.batch
         visible_mask = batch['visible_mask']
+        
         targets = self.prepare_targets(labels, batch_assignment, visible_mask)
         loss_dict = self.loss_fn(outputs, targets)
         metrics = compute_assignment_accuracy(outputs, targets, loss_dict['soft_assignments'])
@@ -260,10 +258,9 @@ class LightningModel(L.LightningModule):
         if not (isinstance(batch, dict) and 'batch' in batch):
             raise RuntimeError("Data must be batch from dataloader")
         
-        coords_with_pe, edge_index, edge_attr_with_pe, batch_assignment, _ = self.preprocess_batch(batch)
-        visible_mask = batch['visible_mask']
+        outputs = self(batch)
         
-        outputs = self.model(coords_with_pe, edge_index, edge_attr_with_pe, batch_assignment)
+        visible_mask = batch['visible_mask']
         log_probs = F.log_softmax(outputs['logits'], dim=-1)
         assignments = self.matcher(log_probs, visible_mask)
         
@@ -437,8 +434,7 @@ def create_trainer(config: Config) -> L.Trainer:
     ]
     
     if config.curriculum.enabled:
-        node_dropper = CurriculumNodeDropper(config.curriculum)
-        callbacks.append(CurriculumCallback(config.curriculum, node_dropper))
+        callbacks.append(CurriculumCallback(config.curriculum))
     
     logger = None
     if config.experiment.wandb_project:
