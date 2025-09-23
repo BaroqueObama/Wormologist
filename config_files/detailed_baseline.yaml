@@ -1,0 +1,179 @@
+experiment:
+  experiment_name: "Baseline"
+  wandb_project: "celegans"
+  wandb_tags: ["accurate", "muon", "yaml", "no_curr", "rot_invar"]
+  log_interval: 10
+  save_top_k: 3
+  monitor_metric: "val/accuracy"
+  monitor_mode: "max"
+
+model:
+  hidden_dim: 256
+  num_heads: 8
+  num_layers: 8
+  
+  use_mla_layers: [4, 5, 6, 7]  # Which layers use MLA
+  mla_kv_latent_dim: 64       # KV compression (256→64)
+
+  edge_correction_dim_ratio: 0.5  # Edge attention overhead
+  learnable_edge_weight: true
+  initial_edge_weight: 0.5
+
+  ffn_dim_multiplier: 4.0
+
+  norm_style: "pre_post"
+
+  k_hops: 31
+  update_edge_repr: true
+
+  use_multiscale_pe: false  # Enable multi-scale RRWP filtration
+  num_scales: 4  # Number of different scales for filtration
+  min_sigma: 0.1  # Minimum sigma for Gaussian kernel (very local)
+  max_sigma: 0.7  # Maximum sigma for Gaussian kernel (regional)
+  learnable_scales: true
+
+  attn_dropout: 0.0
+  dropout: 0.0
+
+  use_degree_scaler: false
+
+  out_dim: 558
+
+
+training:
+  batch_size: 32
+  micro_batch_size: 2 # Adjust size to fit in GPU memory
+  epochs: 1
+  gradient_clip_val: 1.0
+  val_check_interval: 256
+  limit_val_batches: 64
+  checkpoint_interval: 256
+  seed: 42
+
+
+optimizer:
+  optimizer_type: "muon"
+  
+  # Muon-specific parameters for 2D weight matrices
+  muon_lr: 0.003  # Learning rate for Muon parameters
+  muon_momentum: 0.95  # Momentum coefficient for Muon
+  muon_nesterov: true  # Use Nesterov momentum
+  muon_ns_steps: 5  # Newton-Schulz iteration steps for orthogonalization
+  
+  # AdamW parameters for non-2D params (embeddings, biases, layer norms)
+  muon_adamw_lr: 0.003  # Learning rate for AdamW parameters when using Muon
+  muon_adamw_betas: [0.9, 0.95]  # Betas for AdamW optimizer
+  muon_adamw_eps: 1.0e-8  # Epsilon for AdamW optimizer
+  muon_adamw_wd: 0.01  # Weight decay for AdamW optimizer
+  
+  # Fallback parameters (used if switching to pure AdamW)
+  learning_rate: 0.001
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  momentum: 0.9
+
+
+scheduler:
+  scheduler_type: "cosine"  # "cosine", "linear", "constant"
+  warmup_batches: 512           # Warmup for 512 batches
+  warmup_start_lr: 1.0e-6       # Start from 1e-6
+  min_lr: 0.0005              # End at after cosine decay
+  total_training_batches: 32768 # 16384
+
+
+sinkhorn:
+  num_iterations: 5
+  init_temperature: 1.0
+  final_temperature: 0.01
+  temperature_warmup_steps: 100
+  dustbin_weight: 1.0
+  epsilon: 1e-8
+  one_to_one: false
+
+
+loss:
+  class_weight: 1.0
+  assignment_weight: 1.0
+  label_smoothing: 0.1
+  worm_averaged_loss: true
+
+
+augmentation:
+  enabled: true
+  z_shift_range: [0.005, 0.035]
+  z_shift_distribution: "beta"  # "uniform" or "beta"
+  z_shift_beta_alpha: 1.0  # Beta distribution shape parameter
+  z_shift_beta_beta: 1.0   # Beta distribution shape parameter
+
+  # Uniform scaling parameters (applied to all axes before rotation)
+  uniform_scale_range: [0.88, 1.05]
+  uniform_scale_distribution: "beta"  # "uniform" or "beta"
+  uniform_scale_beta_alpha: 1.0  # Beta distribution shape parameter
+  uniform_scale_beta_beta: 1.0   # Beta distribution shape parameter
+  
+  # Rotation range for z-axis in degrees
+  z_rotation_range: [-10.0, 10.0]
+  rotation_distribution: "uniform"  # "uniform" or "beta" for rotation
+  rotation_beta_alpha: 1.0  # Beta distribution shape parameter for rotation
+  rotation_beta_beta: 1.0   # Beta distribution shape parameter for rotation
+
+  # Post-rotation x-axis scaling (y-axis scales by 1/x_scale to preserve area)
+  post_rotation_xy_scale_range: [0.8, 1.2]
+  post_rotation_xy_scale_distribution: "beta"  # "uniform" or "beta"
+  post_rotation_xy_scale_beta_alpha: 1.2  # Beta distribution shape parameter
+  post_rotation_xy_scale_beta_beta: 1.2   # Beta distribution shape parameter
+  # Random orientation for xy scaling (in degrees, 0-360)
+  xy_scale_orientation_range: [0.0, 360.0]
+
+  apply_to_splits: ["train", "val"]
+  seed: 42
+
+
+curriculum:
+  enabled: true
+  start_visibility: 1.0
+  end_visibility: 0.15
+  warmup_batches: 128
+  curriculum_batches: 512
+  cooldown_batches: 32768
+  train_distribution: "beta"
+  curriculum_beta_alpha: 0.9  # Alpha parameter for curriculum phase
+  curriculum_beta_beta: 1.6   # Beta parameter for curriculum phase
+  cooldown_beta_alpha: 1.0    # Alpha parameter for cooldown phase
+  cooldown_beta_beta: 2.0     # Beta parameter for cooldown phase
+  truncated_std: 0.1
+  val_distribution: "uniform"
+  val_min_visibility: 0.18
+  val_max_visibility: 0.22
+  seed: 42
+
+
+data:
+  data_path: "/fs/gpfs41/lv11/fileset01/pool/pool-smola/pythonny/data/long_train"
+  coordinate_system: "cylindrical"  # "cartesian" or "cylindrical"
+  normalize_coords: false  # Disabled to avoid issues with subgraphs
+  use_cell_type_features: true  # Include one-hot encoded cell type features
+  num_workers: 0
+  pin_memory: true
+
+
+graph:
+  distance_kernel: "inverse"
+  kernel_sigma: 0.5
+  use_random_walks: true
+  walk_length: 31
+
+
+system:
+  device: "cuda"
+  mixed_precision: "bf16-mixed"  # "bf16", "fp16", "fp32"
+  distributed: true
+  num_gpus: 4
+
+storage:
+  # Custom storage directories
+  checkpoint_dir: "/fs/home/smola/code/Wormologist/checkpoints"  # Base directory for checkpoints
+  wandb_dir: "/fs/home/smola/code/Wormologist/wandb"  # Base directory for wandb files
+  use_experiment_subdir: true  # Create subdirectory with experiment name
+  save_config_copy: true  # Save a copy of the config with checkpoints

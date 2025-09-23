@@ -25,7 +25,7 @@ class ModelConfig:
     num_layers: int = 8
     
     # MLA (Multi-head Latent Attention) configuration
-    use_mla_layers: List[int] = [4, 5, 6, 7]  # Which layers use MLA (e.g., [8,9,10,11,12,13,14,15])
+    use_mla_layers: List[int] = field(default_factory=lambda: [4, 5, 6, 7])  # Which layers use MLA (e.g., [8,9,10,11,12,13,14,15])
     mla_kv_latent_dim: int = 64  # KV compression dimension (d_c in DeepSeek-V2)
     
     # Hybrid configuration for MLA + edge correction

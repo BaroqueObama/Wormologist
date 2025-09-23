@@ -1,0 +1,21 @@
+experiment:
+  experiment_name: "Baseline"
+  wandb_project: "celegans"
+  wandb_tags: ["accurate", "muon", "yaml", "no_curr", "rot_invar"]
+
+
+training:
+  micro_batch_size: 2 # Adjust size to fit in GPU memory
+
+
+data:
+  data_path: "/fs/gpfs41/lv11/fileset01/pool/pool-smola/pythonny/data/long_train"
+
+
+system:
+  num_gpus: 4
+
+
+storage:
+  checkpoint_dir: "/fs/home/smola/code/Wormologist/checkpoints"  # Base directory for checkpoints
+  wandb_dir: "/fs/home/smola/code/Wormologist/wandb"  # Base directory for wandb files
