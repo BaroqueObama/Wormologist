@@ -216,8 +216,8 @@ class LightningModel(L.LightningModule):
         self.log('train/temperature', self.loss_fn.matcher.temperature, batch_size=batch_size)
         
         # Log multi-scale rrwp sigma values
-        if self.config.model.use_multiscale_pe and hasattr(self.model.pe_module, 'log_sigmas'):
-            sigmas = torch.exp(self.model.pe_module.log_sigmas).detach()
+        if self.config.model.use_multiscale_pe and hasattr(self.pe_module, 'log_sigmas'):
+            sigmas = torch.exp(self.pe_module.log_sigmas).detach()
             for i, sigma in enumerate(sigmas):
                 self.log(f'multiscale/sigma_{i}', sigma.item(), on_step=True, batch_size=batch_size)
             self.log('multiscale/sigma_min', sigmas.min().item(), on_step=True, batch_size=batch_size)
