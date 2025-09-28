@@ -31,7 +31,7 @@ class Wormologist(nn.Module):
         )
     
     
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: Optional[torch.Tensor] = None, batch: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: Optional[torch.Tensor] = None, batch: torch.Tensor = None) -> Dict[str, torch.Tensor]:
         """
         Forward pass.
         
@@ -46,6 +46,9 @@ class Wormologist(nn.Module):
              - logits: Classification logits [batch_size, max_nodes, 558]
         """
         
+        # Batch tensor is required - fail loudly if missing
+        assert batch is not None, ("Batch tensor is required for model forward pass.")
+        
         x = self.node_encoder(x)  # [num_nodes, hidden_dim]
         
         if self.edge_encoder is not None and edge_attr is not None:
@@ -57,32 +60,27 @@ class Wormologist(nn.Module):
         
         logits = self.classification_head(x)  # [num_nodes, 558]
         
-        if batch is not None:
-            batch_size = batch.max().item() + 1
-            
-            max_nodes = 0
-            for b in range(batch_size):
-                num_nodes_in_graph = (batch == b).sum().item()
-                max_nodes = max(max_nodes, num_nodes_in_graph)
-            
-            batched_logits = torch.zeros(
-                batch_size, max_nodes, self.config.out_dim,
-                device=logits.device, dtype=logits.dtype
-            )
-            
-            # Fill in batched tensors
-            for b in range(batch_size):
-                mask = (batch == b)
-                num_nodes_in_graph = mask.sum().item()
-                if num_nodes_in_graph > 0:
-                    batched_logits[b, :num_nodes_in_graph] = logits[mask]
-            
-            outputs = {
-                "logits": batched_logits,
-            }
-        else:
-            outputs = {
-                "logits": logits.unsqueeze(0),
-            }
+        batch_size = batch.max().item() + 1
+        
+        max_nodes = 0
+        for b in range(batch_size):
+            num_nodes_in_graph = (batch == b).sum().item()
+            max_nodes = max(max_nodes, num_nodes_in_graph)
+        
+        batched_logits = torch.zeros(
+            batch_size, max_nodes, self.config.out_dim,
+            device=logits.device, dtype=logits.dtype
+        )
+        
+        # Fill in batched tensors
+        for b in range(batch_size):
+            mask = (batch == b)
+            num_nodes_in_graph = mask.sum().item()
+            if num_nodes_in_graph > 0:
+                batched_logits[b, :num_nodes_in_graph] = logits[mask]
+        
+        outputs = {
+            "logits": batched_logits,
+        }
         
         return outputs

@@ -164,14 +164,11 @@ class HybridAttention(nn.Module):
         return out
     
     def apply_mla(self, x, mask=None):
-        """Apply MLA attention mechanism"""
+        """Apply MLA attention mechanism, expects batched input [B, N, D]"""
         
-        batch_size = 1 if x.dim() == 2 else x.shape[0]
-        seq_len = x.shape[-2]
+        assert x.dim() == 3, f"MLA expects 3D input [batch, nodes, dim], got {x.dim()}D with shape {x.shape}"
         
-        # Ensure x is 3D # TODO: Not good code practice, fix later
-        if x.dim() == 2:
-            x = x.unsqueeze(0)
+        batch_size, seq_len, hidden_dim = x.shape
         
         Q = self.mla_W_Q(x)
         
@@ -207,49 +204,48 @@ class HybridAttention(nn.Module):
         # Reshape back
         attn_output = rearrange(attn_output, 'b h s d -> b s (h d)')
         
-        # Return to original shape if needed
-        if batch_size == 1:
-            attn_output = attn_output.squeeze(0)
-        
+        # Always return 3D tensor
         return attn_output
     
     def forward_mla_hybrid(self, x, edge_index, edge_attr=None, batch=None):
         """Forward pass for MLA with edge correction"""
         
-        if batch is not None:
-            # Batch processing for MLA
-            batch_size = batch.max().item() + 1
-            x_batched = []
-            for b in range(batch_size):
-                mask = (batch == b)
-                x_batched.append(x[mask])
-            
-            # Pad sequences # TODO: inefficient, fix later
-            max_len = max(x_b.size(0) for x_b in x_batched)
-            x_padded = torch.zeros(batch_size, max_len, x.size(1), device=x.device)
-            masks = torch.zeros(batch_size, max_len, dtype=torch.bool, device=x.device)
-            
-            for b, x_b in enumerate(x_batched):
-                len_b = x_b.size(0)
-                x_padded[b, :len_b] = x_b
-                masks[b, :len_b] = True
-            
-            # Apply MLA
-            x_global = self.apply_mla(x_padded, masks)
-            
-            # Unpad
-            x_global_list = []
-            for b in range(batch_size):
-                mask = (batch == b)
-                num_nodes_b = mask.sum().item()
-                x_global_list.append(x_global[b, :num_nodes_b])
-            x_global = torch.cat(x_global_list, dim=0)
-        else:
-            # Single graph
-            x_global = self.apply_mla(x)
+        assert batch is not None, ("Batch tensor is required for MLA attention.")
+        
+        # Process batched graphs for MLA
+        batch_size = batch.max().item() + 1
+        x_batched = []
+        for b in range(batch_size):
+            mask = (batch == b)
+            x_batched.append(x[mask])
+        
+        # Pad sequences for batch processing
+        max_len = max(x_b.size(0) for x_b in x_batched)
+        x_padded = torch.zeros(batch_size, max_len, x.size(1), device=x.device)
+        masks = torch.zeros(batch_size, max_len, dtype=torch.bool, device=x.device)
+        
+        for b, x_b in enumerate(x_batched):
+            len_b = x_b.size(0)
+            x_padded[b, :len_b] = x_b
+            masks[b, :len_b] = True
+        
+        # Apply MLA (expects 3D input)
+        x_global = self.apply_mla(x_padded, masks)
+        
+        # Unpad
+        x_global_list = []
+        for b in range(batch_size):
+            mask = (batch == b)
+            num_nodes_b = mask.sum().item()
+            x_global_list.append(x_global[b, :num_nodes_b])
+        x_global = torch.cat(x_global_list, dim=0)
         
         # Compute edge correction
         x_edge = self.compute_edge_correction(x, edge_index, edge_attr)
+        
+        # Ensure dimensions match for addition
+        assert x_global.shape == x_edge.shape, \
+            f"Shape mismatch: x_global {x_global.shape} vs x_edge {x_edge.shape}"
         
         # Combine with learnable weight
         x_out = x_global + self.edge_weight * x_edge
@@ -306,6 +302,8 @@ class HybridAttention(nn.Module):
     def forward(self, x, edge_index, edge_attr=None, batch=None):
         """Main forward pass"""
         
+        assert batch is not None, ("Batch tensor is required for attention forward pass.")
+        
         if self.use_mla:
             # MLA with edge correction
             x_out = self.forward_mla_hybrid(x, edge_index, edge_attr, batch)
@@ -316,7 +314,7 @@ class HybridAttention(nn.Module):
                 edge_attr_out = self.dropout(edge_attr_out)
             
         else:
-            # Standard GRIT
+            # Standard GRIT (batch not used in computation but required for consistency)
             x_out, attn_features = self.forward_grit(x, edge_index, edge_attr)
             
             edge_attr_out = None
