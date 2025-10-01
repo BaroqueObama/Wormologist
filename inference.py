@@ -14,6 +14,8 @@ from loader.coordinate_encoder import CoordinateEncoder
 from loader.graph_encoder import GraphEncoder
 from loader.cell_types import CELL_TYPES, NUM_CELL_TYPES
 from model.lightning_model import LightningModel
+import pickle
+import json
 
 
 def handle_state_dict_gpu_mismatch(state_dict: dict, remove_module_prefix: bool = True) -> dict:
@@ -93,6 +95,10 @@ def prepare_raw_pointcloud(coords_3d: torch.Tensor, config: Config, device: str 
     batch_size = coords_3d.shape[0]
     
     coords_3d = coords_3d.to(device)
+
+    # This was added to make it work with the GPU
+    if cell_types is not None:
+        cell_types = cell_types.to(device)
     
     coordinate_encoder = CoordinateEncoder(coordinate_system=config.data.coordinate_system, normalize=config.data.normalize_coords)
     
@@ -204,3 +210,197 @@ def example_raw_pointcloud_inference():
     print(f"Predictions: {results['predictions']}")
     
     return results
+
+# A simple function that does not work with the DataLoader
+def test_inference(test_file_path, checkpoint_path):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model, _ = load_model_from_checkpoint(checkpoint_path, device=device)
+
+    test_path = Path(test_file_path)
+    if not test_path.exists():
+        raise FileNotFoundError(f"Could not find test data at {test_path}")
+
+    with test_path.open("rb") as handle:
+        worm_samples = pickle.load(handle)
+
+    all_results = []
+    total_nodes = 0
+    total_top1_correct = 0
+    total_top3_correct = 0
+    total_top5_correct = 0
+
+    for worm_idx, sample in enumerate(worm_samples):
+        if len(sample) != 2:
+            raise ValueError(f"Unexpected sample structure at index {worm_idx}: {sample}")
+
+        canonical_ids, coords = sample
+        canonical_ids = np.asarray(canonical_ids, dtype=np.int64)
+        coords = np.asarray(coords, dtype=np.float32)
+
+        if canonical_ids.ndim != 1:
+            raise ValueError(f"Canonical id array must be 1-D, got shape {canonical_ids.shape}")
+        if coords.ndim != 2 or coords.shape[1] != 3:
+            raise ValueError(f"Coordinate array must be [N, 3], got shape {coords.shape}")
+        if canonical_ids.size == 0:
+            continue
+        if canonical_ids.min() < 0 or canonical_ids.max() >= len(CELL_TYPES):
+            raise ValueError(f"Canonical IDs out of range for cell type lookup at worm {worm_idx}")
+
+        cell_types = CELL_TYPES[canonical_ids]
+        result = predict_single_pointcloud(
+            model,
+            coords,
+            device=device,
+            cell_types=cell_types,
+        )
+
+        num_nodes = canonical_ids.shape[0]
+        gt_ids = torch.from_numpy(canonical_ids).long()
+
+        pred_tensor = result["predictions"].view(-1).long()[:num_nodes]
+        logits_tensor = result["logits"]
+        if logits_tensor.dim() == 3 and logits_tensor.shape[0] == 1:
+            logits_tensor = logits_tensor[0]
+        logits_tensor = logits_tensor[:num_nodes]
+
+        worm_top1_correct = (pred_tensor == gt_ids).sum().item()
+
+        k5 = min(5, logits_tensor.shape[-1])
+        k3 = min(3, k5)
+        topk = torch.topk(logits_tensor, k=k5, dim=-1).indices
+        top3 = topk[:, :k3]
+
+        worm_top3_correct = (top3 == gt_ids.unsqueeze(1)).any(dim=1).sum().item()
+        worm_top5_correct = (topk == gt_ids.unsqueeze(1)).any(dim=1).sum().item()
+
+        worm_metrics = {
+            "num_nodes": num_nodes,
+            "top1_accuracy": worm_top1_correct / num_nodes,
+            "top3_accuracy": worm_top3_correct / num_nodes,
+            "top5_accuracy": worm_top5_correct / num_nodes,
+        }
+
+        print(
+            f"Worm {worm_idx}: top1 {worm_metrics['top1_accuracy']:.3%}, "
+            f"top3 {worm_metrics['top3_accuracy']:.3%}, "
+            f"top5 {worm_metrics['top5_accuracy']:.3%}"
+        )
+
+        all_results.append(
+            {
+                "canonical_ids": canonical_ids,
+                "predictions": pred_tensor.clone(),
+                "logits": logits_tensor.clone(),
+                "metrics": worm_metrics,
+            }
+        )
+
+        total_nodes += num_nodes
+        total_top1_correct += worm_top1_correct
+        total_top3_correct += worm_top3_correct
+        total_top5_correct += worm_top5_correct
+
+    if total_nodes == 0:
+        raise ValueError(f"No valid samples found in {test_path}")
+
+    metrics = {
+        "top1_accuracy": total_top1_correct / total_nodes,
+        "top3_accuracy": total_top3_correct / total_nodes,
+        "top5_accuracy": total_top5_correct / total_nodes,
+        "total_nodes": total_nodes,
+        "num_worms": len(all_results),
+    }
+
+    print(
+        f"Overall: top1 {metrics['top1_accuracy']:.3%}, "
+        f"top3 {metrics['top3_accuracy']:.3%}, "
+        f"top5 {metrics['top5_accuracy']:.3%} "
+        f"over {metrics['total_nodes']} nuclei across {metrics['num_worms']} worms"
+    )
+
+    return {"samples": all_results, "metrics": metrics}
+
+# Helper to find all subgraph datasets
+def _discover_subgraph_datasets(subgraph_root: Union[str, Path]) -> List[Path]:
+    subgraph_root = Path(subgraph_root)
+    dataset_dirs: List[Path] = []
+    for candidate in sorted(subgraph_root.glob("subgraph_*")):
+        test_dir = candidate / "test"
+        if test_dir.is_dir():
+            dataset_dirs.append(candidate)
+    if not dataset_dirs:
+        raise ValueError(f"No subgraph_* directories with a test/ split found under {subgraph_root}")
+    return dataset_dirs
+
+
+# The "new" testing function that works with the DataLoader
+# It can probably be improved in one for the following ways:
+# - changing the config to be specific for the testing
+# - increase the batch size depending of the subgraph size
+# - fix the progress bar so that it has the right length
+def run_subgraph_suite(
+    subgraph_root: Union[str, Path],
+    checkpoint_path: Union[str, Path],
+    results_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, Dict[str, float]]:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, config = load_model_from_checkpoint(checkpoint_path, device=device)
+
+    trainer = L.Trainer(
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_model_summary=False,
+        enable_progress_bar=True,
+        inference_mode=True,
+    )
+
+    results: Dict[str, Dict[str, float]] = {}
+
+    results_file: Optional[Path] = None
+    if results_path is not None:
+        results_file = Path(results_path)
+        if results_file.is_dir():
+            results_file = results_file / "subgraph_metrics.json"
+        results_file.parent.mkdir(parents=True, exist_ok=True)
+
+
+    for dataset_dir in _discover_subgraph_datasets(subgraph_root):
+        loader = create_data_loader(
+            data_path=dataset_dir,
+            split="test",
+            batch_size=config.training.micro_batch_size,
+            coordinate_system=config.data.coordinate_system,
+            normalize_coords=config.data.normalize_coords,
+            use_cell_type_features=config.data.use_cell_type_features,
+            augmentation_config=None,          # disable augmentations
+            num_workers=0,
+            distributed=False,
+            shuffle_shards=False,
+            shuffle_within_shard=False,
+        )
+
+        metrics = trainer.test(model, dataloaders=loader, ckpt_path=None, verbose=False)
+        split_metrics = metrics[0] if metrics else {}
+        results[dataset_dir.name] = split_metrics
+        print(f"{dataset_dir.name}: {split_metrics}")
+
+        if results_file is not None:
+            with results_file.open("w") as handle:
+                json.dump(results, handle, indent=2)
+
+
+    return results
+
+if __name__ == "__main__":
+    # test_file_path = "/fs/pool/pool-mlsb/bulat/Wormologist/subgraph_testing_data/pool_subgraph_testing_data/subgraph_100.pkl"
+    # # checkpoint_path = "/fs/pool/pool-mlsb/bulat/Wormologist/Baseline_Multiscale/Baseline_Multiscale/last.ckpt"
+    # checkpoint_path = "/fs/pool/pool-mlsb/bulat/Wormologist/checkpoint_all_reproduce/Reproduce/last.ckpt"
+
+    # test_inference(test_file_path, checkpoint_path)
+    subgraph_root = "/fs/pool/pool-mlsb/bulat/Wormologist/new_subgraph_testing_data"
+    checkpoint_path = "/fs/pool/pool-mlsb/bulat/Wormologist/checkpoint_all_reproduce/Reproduce/last.ckpt"
+    results_path = "/fs/pool/pool-mlsb/bulat/Wormologist/redefined_testing_results/6_cell_types"
+
+    run_subgraph_suite(subgraph_root, checkpoint_path, results_path)
