@@ -11,7 +11,7 @@ import random
 from loader.coordinate_encoder import CoordinateEncoder
 from loader.augmentation import DataAugmentation
 from loader.node_dropper import CurriculumNodeDropper
-from loader.cell_types import CELL_TYPES, NUM_CELL_TYPES
+from loader.cell_types import CELL_TYPES, NUM_CELL_TYPES, CELL_TYPES_FINE
 
 
 class CElegansShardedDataset(IterableDataset):
@@ -29,11 +29,12 @@ class CElegansShardedDataset(IterableDataset):
                  shuffle_within_shard: bool = True, # Whether to shuffle specimens within each shard
                  rank: Optional[int] = None, # Current process rank for distributed training
                  world_size: Optional[int] = None, # Total number of processes for distributed training
-                 verbose: bool = False): # Whether to print loading progress
+                 verbose: bool = False,
+                 target: str = "canonical"): # Whether to print loading progress
 
         self.data_path = Path(data_path)
         self.split = split
-        self.use_cell_type_features = use_cell_type_features
+        self.use_cell_type_features = use_cell_type_features and target == "canonical"
         self.coordinate_encoder = CoordinateEncoder(coordinate_system=coordinate_system, normalize=normalize_coords)
         
         self.augmentation = None
@@ -52,6 +53,7 @@ class CElegansShardedDataset(IterableDataset):
         self.verbose = verbose
         self.specimen_counter = 0
         self.split = split
+        self.target = target
         
         split_dir = self.data_path / self.split
         if not split_dir.exists():
@@ -81,12 +83,12 @@ class CElegansShardedDataset(IterableDataset):
         visibility_rate = 1.0  # Default to full visibility
         
         if self.node_dropper is not None:
-            global_batch = self.current_global_batch if self.split == "train" and self.current_global_batch is not None else 0
+            global_batch = (self.current_global_batch if self.split == "train" and self.current_global_batch is not None else 0)
+
             visibility_rate = self.node_dropper.get_visibility_rate(global_batch, self.split)
-            
-            if visibility_rate < 1.0:
-                coords_3d, canonical_ids, keep_indices = self.node_dropper.drop_nodes(coords_3d, canonical_ids, visibility_rate)
-        
+            if visibility_rate < 1.0 or self.node_dropper.strategy == "sliced":
+                coords_3d, canonical_ids, _ = self.node_dropper.drop_nodes(coords_3d, canonical_ids, visibility_rate, global_batch, self.split,)
+
         self.specimen_counter += 1 # for reproducible augmentation
         transformed_coords = self.coordinate_encoder.transform(coords_3d)
         
@@ -97,9 +99,13 @@ class CElegansShardedDataset(IterableDataset):
             node_features = torch.cat([transformed_coords, cell_type_features], dim=-1) # TODO: Ensure this is taken in properly with raw coords stuff
         else:
             node_features = transformed_coords
-        
+
+        # Choose labels based on task
+        cell_type_labels = torch.from_numpy(CELL_TYPES_FINE[canonical_ids]).long()
+        labels = cell_type_labels if self.target == "cell_type" else canonical_ids
+
         # TODO: Check if computing graphs on GPU is actually better
-        data = Data(x=node_features, y=canonical_ids, num_nodes=node_features.shape[0], raw_coords=coords_3d, visibility_rate=visibility_rate)
+        data = Data(x=node_features, y=labels, num_nodes=node_features.shape[0], raw_coords=coords_3d, visibility_rate=visibility_rate)
         return data
     
     
@@ -187,7 +193,9 @@ def create_data_loader(data_path: Union[str, Path], # Path to data directory
                        world_size: Optional[int] = None, # Total processes (auto-detected if distributed=True) # TODO: weird
                        shuffle_shards: bool = None, # Whether to shuffle shard order (default: True for train)
                        shuffle_within_shard: bool = None, # Whether to shuffle within shards (default: True for train)
-                       **dataset_kwargs) -> DataLoader: # Additional dataset arguments
+                       target: str = "canonical", # Choose the task, canonical ID prediction or cell type prediction
+                       **dataset_kwargs,
+                       ) -> DataLoader: # Additional dataset arguments
     
     if distributed and torch.distributed.is_available() and torch.distributed.is_initialized():
         if rank is None:
@@ -203,7 +211,7 @@ def create_data_loader(data_path: Union[str, Path], # Path to data directory
     if shuffle_within_shard is None:
         shuffle_within_shard = (split == "train")
     
-    dataset = CElegansShardedDataset(data_path=data_path, split=split, coordinate_system=coordinate_system, normalize_coords=normalize_coords, use_cell_type_features=use_cell_type_features, augmentation_config=augmentation_config, shuffle_shards=shuffle_shards, shuffle_within_shard=shuffle_within_shard, rank=rank, world_size=world_size, **dataset_kwargs)
+    dataset = CElegansShardedDataset(data_path=data_path, split=split, coordinate_system=coordinate_system, normalize_coords=normalize_coords, use_cell_type_features=use_cell_type_features, augmentation_config=augmentation_config, shuffle_shards=shuffle_shards, shuffle_within_shard=shuffle_within_shard, rank=rank, world_size=world_size, target=target, **dataset_kwargs)
     
     # For IterableDataset, we don't use a sampler and num_workers should be 0
     # Each dataset instance handles its own sharding

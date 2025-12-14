@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
 
 # Configs:
@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 # - SystemConfig
 # - StorageConfig
 # - ExperimentConfig
+# - TaskConfig
 
 @dataclass
 class ModelConfig:
@@ -146,38 +147,48 @@ class LossConfig:
     assignment_weight: float = 1.0
     label_smoothing: float = 0.1
     worm_averaged_loss: bool = True  # Average loss per worm (vs per node)
-
+    use_superglue_loss: bool = False # supervise full Sinkhorn matrix (one-to-one required)
+    # Flags for Sinkhorn finetuning
+    use_topk_sinkhorn_mask: bool = False
+    topk_sinkhorn_k: int = 5
 
 @dataclass
 class AugmentationConfig:
     """Data augmentation configuration"""
     enabled: bool = True  # Whether to apply augmentation
+
+    normalize_z_axis: bool = True
     
     # Z-axis shift parameters (applied after normalizing min z to 0)
-    z_shift_range: List[float] = field(default_factory=lambda: [0.005, 0.035])
+    z_shift_range: List[float] = field(default_factory=lambda: [0.005, 0.035]) # Initialize this with 0.02 and 0.020001
     z_shift_distribution: str = "beta"  # "uniform" or "beta"
     z_shift_beta_alpha: float = 1.0  # Beta distribution shape parameter
     z_shift_beta_beta: float = 1.0   # Beta distribution shape parameter
     
     # Uniform scaling parameters (applied to all axes before rotation)
-    uniform_scale_range: List[float] = field(default_factory=lambda: [0.88, 1.05])
+    uniform_scale_range: List[float] = field(default_factory=lambda: [0.88, 1.05]) # 1 to 1
     uniform_scale_distribution: str = "beta"  # "uniform" or "beta"
     uniform_scale_beta_alpha: float = 1.0  # Beta distribution shape parameter
     uniform_scale_beta_beta: float = 1.0   # Beta distribution shape parameter
     
     # Rotation range for z-axis in degrees
-    z_rotation_range: List[float] = field(default_factory=lambda: [-10.0, 10.0])
+    z_rotation_range: List[float] = field(default_factory=lambda: [-10.0, 10.0]) # 0 to 0
     rotation_distribution: str = "uniform"  # "uniform" or "beta" for rotation
     rotation_beta_alpha: float = 1.5  # Beta distribution shape parameter for rotation
     rotation_beta_beta: float = 1.5   # Beta distribution shape parameter for rotation
     
     # Post-rotation xy-plane scaling (scales along random orientation, orthogonal scales by 1/scale)
-    post_rotation_xy_scale_range: List[float] = field(default_factory=lambda: [0.8, 1.2])
+    post_rotation_xy_scale_range: List[float] = field(default_factory=lambda: [0.8, 1.2]) # 1 to 1
     post_rotation_xy_scale_distribution: str = "beta"  # "uniform" or "beta"
     post_rotation_xy_scale_beta_alpha: float = 1.2  # Beta distribution shape parameter
     post_rotation_xy_scale_beta_beta: float = 1.2   # Beta distribution shape parameter
     # Random orientation for xy scaling (in degrees, 0-360)
-    xy_scale_orientation_range: List[float] = field(default_factory=lambda: [0.0, 360.0])
+    xy_scale_orientation_range: List[float] = field(default_factory=lambda: [0.0, 360.0]) # 0 to 0
+
+    # XY jitter (planar translation)
+    xy_jitter_mode: str = "none"        # "none", "normal", or "uniform"
+    xy_jitter_std: float = 0.0          # σ for normal mode
+    xy_jitter_range: float = 0.0        # half-width for uniform mode
     
     # Control
     apply_to_splits: List[str] = field(default_factory=lambda: ["train", "val"])  # Only apply to these splits
@@ -189,6 +200,24 @@ class CurriculumConfig:
     """Configuration for curriculum learning with node dropping."""
     # Enable/disable curriculum learning
     enabled: bool = True
+
+    # New parameters for sliced subgraphs curriculum learning
+    ######################
+    subgraph_strategy: str = "random"          # "random" keeps existing behaviour; "sliced" enables PCA slicing
+    slice_max_n_slices: int = 40               
+    slice_thickness: Optional[float] = None    # None ⇒ auto-compute from augmented AP span / n_slices
+    slice_shift: float = 0.0
+    slice_crop_axis: Optional[str] = 'random'      # {"x","y","random",None}
+    slice_crop_side: str = "positive"
+    slice_crop_fraction: float = 0.0
+    slice_seed: int = 42
+    slice_profiles: List[Dict[str, Any]] = field(default_factory=lambda: [
+    {"thickness_fraction": 0.007, "crop_fraction_range": [0.5, 1.0]},
+    {"thickness_fraction": 0.008, "crop_fraction_range": [0.0, 1.0]},
+    {"thickness_fraction": 0.009, "crop_fraction_range": [0.0, 0.5]},
+    ])
+    interpolate_crop_fraction: bool = False
+    ######################
     
     # Visibility range
     start_visibility: float = 1.0  # 100% visible at start
@@ -312,6 +341,10 @@ class ExperimentConfig:
     monitor_metric: str = "val/accuracy"
     monitor_mode: str = "max"
 
+@dataclass
+class TaskConfig:
+    target: str = "canonical"      # "canonical" or "cell_type"
+    num_classes: int = 7           # 0..6 cell types
 
 @dataclass
 class Config:
@@ -329,6 +362,7 @@ class Config:
     system: SystemConfig = field(default_factory=SystemConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     experiment: ExperimentConfig = field(default_factory=ExperimentConfig)
+    task: TaskConfig = field(default_factory=TaskConfig)
     
     @classmethod
     def from_dict(cls, config_dict: dict) -> "Config":
@@ -361,7 +395,9 @@ class Config:
             config.storage = StorageConfig(**config_dict["storage"])
         if "experiment" in config_dict:
             config.experiment = ExperimentConfig(**config_dict["experiment"])
-        
+        if "task" in config_dict:  # ← add this block
+            config.task = TaskConfig(**config_dict["task"])
+
         return config
     
     def to_dict(self) -> dict:
@@ -379,7 +415,8 @@ class Config:
             "graph": self.graph.__dict__,
             "system": self.system.__dict__,
             "storage": self.storage.__dict__,
-            "experiment": self.experiment.__dict__
+            "experiment": self.experiment.__dict__,
+            "task": self.task.__dict__,
         }
     
     def validate(self):
@@ -391,8 +428,11 @@ class Config:
         assert self.model.hidden_dim % self.model.num_heads == 0, "Hidden dim must be divisible by num_heads"
         
         # Model-Sinkhorn consistency check
-        assert self.model.out_dim == self.sinkhorn.num_canonical, \
-            f"Model out_dim ({self.model.out_dim}) must match Sinkhorn num_canonical ({self.sinkhorn.num_canonical})"
+        if self.task.target == "canonical":
+            assert self.model.out_dim == self.sinkhorn.num_canonical, \
+                f"Model out_dim ({self.model.out_dim}) must match Sinkhorn num_canonical ({self.sinkhorn.num_canonical})"
+        else:
+            assert self.task.num_classes > 0, "num_classes must be positive for cell_type task"
         
         # Training validations
         assert self.training.batch_size > 0, "Batch size must be positive"

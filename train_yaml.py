@@ -123,7 +123,9 @@ Examples:
         normalize_coords=config.data.normalize_coords,
         augmentation_config=config.augmentation if config.augmentation.enabled else None,
         curriculum_config=config.curriculum if config.curriculum.enabled else None,
-        verbose=True
+        verbose=True,
+        target=config.task.target,
+        use_cell_type_features=config.data.use_cell_type_features
     )
     
     val_loader = create_data_loader(
@@ -135,7 +137,9 @@ Examples:
         normalize_coords=config.data.normalize_coords,
         augmentation_config=config.augmentation if config.augmentation.enabled else None,
         curriculum_config=config.curriculum if config.curriculum.enabled else None,
-        verbose=False
+        verbose=False,
+        target=config.task.target,
+        use_cell_type_features=config.data.use_cell_type_features
     )
     
     
@@ -168,7 +172,9 @@ Examples:
             distributed=False,
             normalize_coords=config.data.normalize_coords,
             augmentation_config=config.augmentation if config.augmentation.enabled else None,
-            verbose=False
+            verbose=False,
+            target=config.task.target,
+            use_cell_type_features=config.data.use_cell_type_features
         )
         print("\nRunning test evaluation:")
         trainer.test(model, test_loader)

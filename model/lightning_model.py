@@ -17,7 +17,8 @@ from model.sinkhorn import AssignmentLoss, compute_assignment_accuracy
 from model.curriculum_callback import CurriculumCallback
 from config.config import Config
 from optimizers.muon import Muon
-
+import copy
+import torch.nn as nn
 
 class LightningModel(L.LightningModule):
     """Lightning module for training."""
@@ -56,28 +57,55 @@ class LightningModel(L.LightningModule):
         
         edge_input_dim = 4 + pe_edge_dim # Edge features: 4D (distance + direction vector) + PE features
         
+        if config.task.target == "cell_type":
+            config.model.out_dim = config.task.num_classes
+
         self.model = Wormologist(
-            config = config.model,
-            node_input_dim = node_input_dim,
-            edge_input_dim = edge_input_dim
+            config=config.model,
+            node_input_dim=node_input_dim,
+            edge_input_dim=edge_input_dim
         )
         
-        # Loss computation
-        self.loss_fn = AssignmentLoss(
-            num_canonical = config.sinkhorn.num_canonical,
-            num_iterations = config.sinkhorn.num_iterations,
-            temperature = config.sinkhorn.init_temperature,
-            class_weight = config.loss.class_weight,
-            assignment_weight = config.loss.assignment_weight,
-            label_smoothing = config.loss.label_smoothing,
-            worm_averaged_loss = config.loss.worm_averaged_loss,
-            one_to_one = config.sinkhorn.one_to_one
-        )
-        
-        # Share the matcher from loss_fn for inference to avoid unused parameters
-        self.matcher = self.loss_fn.matcher
-    
-    
+        if config.task.target == "canonical":
+            # Loss computation
+            self.loss_fn = AssignmentLoss(
+                num_canonical = config.sinkhorn.num_canonical,
+                num_iterations = config.sinkhorn.num_iterations,
+                temperature = config.sinkhorn.init_temperature,
+                class_weight = config.loss.class_weight,
+                assignment_weight = config.loss.assignment_weight,
+                label_smoothing = config.loss.label_smoothing,
+                worm_averaged_loss = config.loss.worm_averaged_loss,
+                one_to_one = config.sinkhorn.one_to_one,
+                use_superglue_loss = config.loss.use_superglue_loss,
+                use_topk_sinkhorn_mask = config.loss.use_topk_sinkhorn_mask,
+                topk_sinkhorn_k = config.loss.topk_sinkhorn_k,
+            )
+            
+            # Share the matcher from loss_fn for inference to avoid unused parameters
+            self.matcher = self.loss_fn.matcher
+        else:
+            self.ce_loss = nn.CrossEntropyLoss(label_smoothing=config.loss.label_smoothing)
+            self.matcher = None
+
+    # TODO: This should be elswhere
+    def _ce_loss_and_metrics(self, logits, labels, visible_mask):
+        flat_mask = visible_mask.bool()
+        flat_logits = logits[flat_mask]
+        flat_labels = labels[flat_mask]
+        loss = self.ce_loss(flat_logits, flat_labels)
+        probs = torch.softmax(logits, dim=-1)
+        vis_probs = probs[flat_mask]
+        top1 = vis_probs.argmax(dim=-1)
+        topk = torch.topk(vis_probs, k=min(5, vis_probs.shape[-1]), dim=-1).indices
+        metrics = {
+            'loss': loss,
+            'accuracy': (top1 == flat_labels).float().mean(),
+            'top3': (flat_labels.unsqueeze(1) == topk[:, :3]).any(dim=1).float().mean(),
+            'top5': (flat_labels.unsqueeze(1) == topk).any(dim=1).float().mean(),
+        }
+        return loss, metrics
+
     def forward(self, batch: Dict) -> Dict:
         """Forward pass accepting batch dict from data loader or inference."""
         coords, edge_index, edge_attr, batch_assignment, _ = self.preprocess_batch(batch)
@@ -153,120 +181,317 @@ class LightningModel(L.LightningModule):
         return targets
     
     
-    def _process_batch(self, batch: Dict):
-        outputs = self(batch)
+    def _process_batch(self, batch: Dict, compute_hungarian: bool = False):
         
-        pyg_batch = batch['batch']
-        labels = pyg_batch.y
-        batch_assignment = pyg_batch.batch
-        visible_mask = batch['visible_mask']
-        
-        targets = self.prepare_targets(labels, batch_assignment, visible_mask)
-        loss_dict = self.loss_fn(outputs, targets)
-        metrics = compute_assignment_accuracy(outputs, targets, loss_dict['soft_assignments'])
-        
-        return loss_dict, metrics
+        if self.config.task.target == "canonical":
+            outputs = self(batch)
 
-    
-    def training_step(self, batch: Dict, batch_idx: int) -> torch.Tensor: 
-        loss_dict, metrics = self._process_batch(batch)
-        
-        self._update_temperature()
-        
-        batch_size = len(batch['visible_mask'])
-        
-        # Log curriculum metrics if curriculum learning is enabled
-        if self.config.curriculum.enabled and hasattr(batch['batch'], 'visibility_rate'):
             pyg_batch = batch['batch']
-            # Extract visibility rates from the batch
-            visibility_rates = []
-            for i in range(len(batch['visible_mask'])):
-                # Get nodes for this sample in the batch
-                mask = (pyg_batch.batch == i)
-                if mask.any():
-                    idx = mask.nonzero()[0].item()
-                    if hasattr(pyg_batch, 'visibility_rate') and idx < len(pyg_batch.visibility_rate):
-                        visibility_rates.append(pyg_batch.visibility_rate[idx].item())
+            labels = pyg_batch.y
+            batch_assignment = pyg_batch.batch
+            visible_mask = batch['visible_mask']
             
-            if visibility_rates:
-                avg_visibility = sum(visibility_rates) / len(visibility_rates)
-                self.log('curriculum/avg_visibility', avg_visibility, on_step=True, batch_size=batch_size)
-                self.log('curriculum/min_visibility', min(visibility_rates), on_step=True, batch_size=batch_size)
-                self.log('curriculum/max_visibility', max(visibility_rates), on_step=True, batch_size=batch_size)
-                
-                phase = self.config.curriculum.get_phase(self.global_batch_counter)
-                target = self.config.curriculum.get_curriculum_target(self.global_batch_counter)
-                
-                phase_map = {'warmup': 0, 'curriculum': 1, 'cooldown': 2, 'uniform': 3} # Map phase to numeric for logging
-                self.log('curriculum/phase', phase_map.get(phase, -1), on_step=True, batch_size=batch_size)
-                if target is not None:
-                    self.log('curriculum/target_visibility', target, on_step=True, batch_size=batch_size)
-                self.log('curriculum/global_batch', self.global_batch_counter, on_step=True, batch_size=batch_size)
-        
-        # Only increment global batch counter after gradient accumulation is complete
-        if (batch_idx + 1) % self.trainer.accumulate_grad_batches == 0:
-            self.global_batch_counter += 1
+            targets = self.prepare_targets(labels, batch_assignment, visible_mask)
+            loss_dict = self.loss_fn(outputs, targets)
+            metrics = compute_assignment_accuracy(outputs, targets, loss_dict['soft_assignments'], dustbin_weights=loss_dict.get('dustbin_weights', None), dustbin_row_weights=loss_dict.get('dustbin_row_weights', None), compute_hungarian=compute_hungarian, full_assignments=loss_dict.get('full_assignments', None))
 
-        self.log('train/loss', loss_dict['total_loss'], on_step=True, on_epoch=True, batch_size=batch_size)
-        self.log('train/class_loss', loss_dict['class_loss'], batch_size=batch_size)
-        self.log('train/assignment_loss', loss_dict['assignment_loss'], batch_size=batch_size)
-        self.log('train/accuracy', metrics['exact_accuracy'], prog_bar=True, batch_size=batch_size)
-        self.log('train/top3_accuracy', metrics['top3_accuracy'], batch_size=batch_size)
-        self.log('train/top5_accuracy', metrics['top5_accuracy'], batch_size=batch_size)
-        self.log('train/temperature', self.loss_fn.matcher.temperature, batch_size=batch_size)
-        
-        # Log multi-scale rrwp sigma values
-        if self.config.model.use_multiscale_pe and hasattr(self.pe_module, 'log_sigmas'):
-            sigmas = torch.exp(self.pe_module.log_sigmas).detach()
-            for i, sigma in enumerate(sigmas):
-                self.log(f'multiscale/sigma_{i}', sigma.item(), on_step=True, batch_size=batch_size)
-            self.log('multiscale/sigma_min', sigmas.min().item(), on_step=True, batch_size=batch_size)
-            self.log('multiscale/sigma_max', sigmas.max().item(), on_step=True, batch_size=batch_size)
-            self.log('multiscale/sigma_range', (sigmas.max() - sigmas.min()).item(), on_step=True, batch_size=batch_size)
-        
-        return loss_dict['total_loss']
+            return loss_dict, metrics
+
+        else:
+            outputs = self(batch)
+            pyg_batch = batch['batch']
+            labels = pyg_batch.y
+            batch_assignment = pyg_batch.batch
+            visible_mask = batch['visible_mask']
+            targets = self.prepare_targets(labels, batch_assignment, visible_mask)  # pads to [B, max_nodes]
+            loss, metrics = self._ce_loss_and_metrics(outputs['logits'], targets['labels'], visible_mask)
+            return {'total_loss': loss}, metrics
+
+    def training_step(self, batch: Dict, batch_idx: int) -> torch.Tensor:
     
-    
+        if self.config.task.target == "canonical":
+            loss_dict, metrics = self._process_batch(batch)
+        
+            self._update_temperature()
+            
+            batch_size = len(batch['visible_mask'])
+            
+            # Log curriculum metrics if curriculum learning is enabled
+            if self.config.curriculum.enabled and hasattr(batch['batch'], 'visibility_rate'):
+                self.log('curriculum/avg_nodes', metrics['avg_nodes'], on_step=True, batch_size=batch_size)
+
+                pyg_batch = batch['batch']
+                # Extract visibility rates from the batch
+                visibility_rates = []
+                for i in range(len(batch['visible_mask'])):
+                    # Get nodes for this sample in the batch
+                    mask = (pyg_batch.batch == i)
+                    if mask.any():
+                        idx = mask.nonzero()[0].item()
+                        if hasattr(pyg_batch, 'visibility_rate') and idx < len(pyg_batch.visibility_rate):
+                            visibility_rates.append(pyg_batch.visibility_rate[idx].item())
+                
+                if visibility_rates:
+                    avg_visibility = sum(visibility_rates) / len(visibility_rates)
+                    self.log('curriculum/avg_visibility', avg_visibility, on_step=True, batch_size=batch_size)
+                    self.log('curriculum/min_visibility', min(visibility_rates), on_step=True, batch_size=batch_size)
+                    self.log('curriculum/max_visibility', max(visibility_rates), on_step=True, batch_size=batch_size)
+                    
+                    phase = self.config.curriculum.get_phase(self.global_batch_counter)
+                    target = self.config.curriculum.get_curriculum_target(self.global_batch_counter)
+                    
+                    phase_map = {'warmup': 0, 'curriculum': 1, 'cooldown': 2, 'uniform': 3} # Map phase to numeric for logging
+                    self.log('curriculum/phase', phase_map.get(phase, -1), on_step=True, batch_size=batch_size)
+                    if target is not None:
+                        self.log('curriculum/target_visibility', target, on_step=True, batch_size=batch_size)
+                    self.log('curriculum/global_batch', self.global_batch_counter, on_step=True, batch_size=batch_size)
+            
+            # Only increment global batch counter after gradient accumulation is complete
+            if (batch_idx + 1) % self.trainer.accumulate_grad_batches == 0:
+                self.global_batch_counter += 1
+
+            self.log('train/loss', loss_dict['total_loss'], on_step=True, on_epoch=True, batch_size=batch_size)
+
+            if 'superglue_loss' in loss_dict:
+                self.log('train/superglue_loss', loss_dict['superglue_loss'], batch_size=batch_size)
+            else:
+                self.log('train/class_loss', loss_dict['class_loss'], batch_size=batch_size)
+                self.log('train/assignment_loss', loss_dict['assignment_loss'], batch_size=batch_size)
+            
+            self.log('train/accuracy', metrics['exact_accuracy'], prog_bar=True, batch_size=batch_size)
+            self.log('train/top3_accuracy', metrics['top3_accuracy'], batch_size=batch_size)
+            self.log('train/top5_accuracy', metrics['top5_accuracy'], batch_size=batch_size)
+            self.log('train/temperature', self.loss_fn.matcher.temperature, batch_size=batch_size)
+
+            self.log('train/accuracy_logits', metrics['exact_accuracy_logits'], batch_size=batch_size, sync_dist=True)
+            self.log('train/top3_accuracy_logits', metrics['top3_accuracy_logits'], batch_size=batch_size, sync_dist=True)
+            self.log('train/top5_accuracy_logits', metrics['top5_accuracy_logits'], batch_size=batch_size, sync_dist=True)
+
+            # SuperGlue metrics (training)
+            if 'sg_exact_match_acc' in metrics:
+                self.log('train/sg_exact_match_acc', metrics['sg_exact_match_acc'], batch_size=batch_size)
+                self.log('train/sg_num_matched', metrics['sg_num_matched'], batch_size=batch_size)
+                self.log('train/sg_num_unmatched_rows', metrics['sg_num_unmatched_rows'], batch_size=batch_size)
+                self.log('train/sg_num_unmatched_cols', metrics['sg_num_unmatched_cols'], batch_size=batch_size)
+
+                self.log('train/sg_conf_matched', metrics['sg_conf_matched'], batch_size=batch_size)
+                self.log('train/sg_conf_unmatched_rows', metrics['sg_conf_unmatched_rows'], batch_size=batch_size)
+                self.log('train/sg_conf_unmatched_cols', metrics['sg_conf_unmatched_cols'], batch_size=batch_size)
+
+                self.log('train/sg_loss_matched', metrics['sg_loss_matched'], batch_size=batch_size)
+                self.log('train/sg_loss_unmatched_rows', metrics['sg_loss_unmatched_rows'], batch_size=batch_size)
+                self.log('train/sg_loss_unmatched_cols', metrics['sg_loss_unmatched_cols'], batch_size=batch_size)
+
+            # SuperGlue dustbin parameters (training)
+            self.log('train/sg_dustbin_col_score', self.loss_fn.matcher.dustbin_col_score, batch_size=batch_size)
+            if self.loss_fn.matcher.one_to_one:
+                self.log('train/sg_dustbin_row_score', self.loss_fn.matcher.dustbin_row_score, batch_size=batch_size)
+                self.log('train/sg_dustbin_corner_score', self.loss_fn.matcher.dustbin_corner_score, batch_size=batch_size)
+
+            
+            # Log multi-scale rrwp sigma values
+            if self.config.model.use_multiscale_pe and hasattr(self.pe_module, 'log_sigmas'):
+                sigmas = torch.exp(self.pe_module.log_sigmas).detach()
+                for i, sigma in enumerate(sigmas):
+                    self.log(f'multiscale/sigma_{i}', sigma.item(), on_step=True, batch_size=batch_size)
+                self.log('multiscale/sigma_min', sigmas.min().item(), on_step=True, batch_size=batch_size)
+                self.log('multiscale/sigma_max', sigmas.max().item(), on_step=True, batch_size=batch_size)
+                self.log('multiscale/sigma_range', (sigmas.max() - sigmas.min()).item(), on_step=True, batch_size=batch_size)
+            
+            return loss_dict['total_loss']
+        else:
+            loss_dict, metrics = self._process_batch(batch)
+            batch_size = len(batch['visible_mask'])
+            # if self.config.curriculum.enabled and hasattr(batch['batch'], 'visibility_rate'):
+            #     self.log('curriculum/avg_nodes', metrics.get('avg_nodes', 0), on_step=True, batch_size=batch_size)
+            if (batch_idx + 1) % self.trainer.accumulate_grad_batches == 0:
+                self.global_batch_counter += 1
+            self.log('train/loss', loss_dict['total_loss'], on_step=True, on_epoch=True, batch_size=batch_size)
+            self.log('train/accuracy', metrics['accuracy'], prog_bar=True, batch_size=batch_size)
+            self.log('train/top3_accuracy', metrics['top3'], batch_size=batch_size)
+            self.log('train/top5_accuracy', metrics['top5'], batch_size=batch_size)
+            return loss_dict['total_loss']
+
+           
     def validation_step(self, batch: Dict, batch_idx: int) -> None:
-        loss_dict, metrics = self._process_batch(batch)
+        if self.config.task.target == "canonical":
+            loss_dict, metrics = self._process_batch(batch)
         
-        batch_size = len(batch['visible_mask'])
-        
-        # Use sync_dist=True for proper aggregation across GPUs
-        self.log('val/loss', loss_dict['total_loss'], on_epoch=True, prog_bar=True, batch_size=batch_size, sync_dist=True)
-        self.log('val/accuracy', metrics['exact_accuracy'], on_epoch=True, prog_bar=True, batch_size=batch_size, sync_dist=True)
-        self.log('val/top3_accuracy', metrics['top3_accuracy'], on_epoch=True, batch_size=batch_size, sync_dist=True)
-        self.log('val/top5_accuracy', metrics['top5_accuracy'], on_epoch=True, batch_size=batch_size, sync_dist=True)
-    
-    
+            batch_size = len(batch['visible_mask'])
+            
+            # Use sync_dist=True for proper aggregation across GPUs
+            # Not sure is I should log all of these for the validation as well. Am I slowing it down?
+            self.log('val/loss', loss_dict['total_loss'], on_epoch=True, prog_bar=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/accuracy', metrics['exact_accuracy'], on_epoch=True, prog_bar=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/top3_accuracy', metrics['top3_accuracy'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/top5_accuracy', metrics['top5_accuracy'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/top1_mass', metrics['node_avg_top1_mass'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/top2_mass', metrics['node_avg_top2_mass'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/top3_mass', metrics['node_avg_top3_mass'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/top5_mass', metrics['node_avg_top5_mass'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/top10_mass', metrics['node_avg_top10_mass'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/top1_gap', metrics['node_avg_gap_top1_correct'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/top1_rank', metrics['node_avg_rank_top1_correct'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/top1_mass_sinkhorn', metrics['node_avg_top1_mass_sinkhorn'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/top2_mass_sinkhorn', metrics['node_avg_top2_mass_sinkhorn'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/top3_mass_sinkhorn', metrics['node_avg_top3_mass_sinkhorn'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/top5_mass_sinkhorn', metrics['node_avg_top5_mass_sinkhorn'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/top10_mass_sinkhorn', metrics['node_avg_top10_mass_sinkhorn'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/top1_gap_sinkhorn', metrics['node_avg_gap_top1_correct_sinkhorn'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/top1_rank_sinkhorn', metrics['node_avg_rank_top1_correct_sinkhorn'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/node_avg_dustbin_share', metrics['node_avg_dustbin_share'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            if 'canonical_avg_dustbin_row_share' in metrics:
+                self.log('val/canonical_avg_dustbin_row_share', metrics['canonical_avg_dustbin_row_share'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/avg_nodes', metrics['avg_nodes'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            
+            # SuperGlue metrics (validation)
+            if 'sg_exact_match_acc' in metrics:
+                self.log('val/sg_exact_match_acc', metrics['sg_exact_match_acc'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+                self.log('val/sg_num_matched', metrics['sg_num_matched'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+                self.log('val/sg_num_unmatched_rows', metrics['sg_num_unmatched_rows'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+                self.log('val/sg_num_unmatched_cols', metrics['sg_num_unmatched_cols'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+
+                self.log('val/sg_conf_matched', metrics['sg_conf_matched'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+                self.log('val/sg_conf_unmatched_rows', metrics['sg_conf_unmatched_rows'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+                self.log('val/sg_conf_unmatched_cols', metrics['sg_conf_unmatched_cols'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+
+                self.log('val/sg_loss_matched', metrics['sg_loss_matched'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+                self.log('val/sg_loss_unmatched_rows', metrics['sg_loss_unmatched_rows'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+                self.log('val/sg_loss_unmatched_cols', metrics['sg_loss_unmatched_cols'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+
+            # SuperGlue dustbin parameters (validation)
+            self.log('val/sg_dustbin_col_score', self.loss_fn.matcher.dustbin_col_score,
+                    on_epoch=True, batch_size=batch_size, sync_dist=True)
+            if self.loss_fn.matcher.one_to_one:
+                self.log('val/sg_dustbin_row_score', self.loss_fn.matcher.dustbin_row_score,
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+                self.log('val/sg_dustbin_corner_score', self.loss_fn.matcher.dustbin_corner_score,
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+                
+            self.log('val/accuracy_logits', metrics['exact_accuracy_logits'], batch_size=batch_size, sync_dist=True)
+            self.log('val/top3_accuracy_logits', metrics['top3_accuracy_logits'], batch_size=batch_size, sync_dist=True)
+            self.log('val/top5_accuracy_logits', metrics['top5_accuracy_logits'], batch_size=batch_size, sync_dist=True)
+        else:
+            loss_dict, metrics = self._process_batch(batch)
+            batch_size = len(batch['visible_mask'])
+            self.log('val/loss', loss_dict['total_loss'], on_epoch=True, prog_bar=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/accuracy', metrics['accuracy'], on_epoch=True, prog_bar=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/top3_accuracy', metrics['top3'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            self.log('val/top5_accuracy', metrics['top5'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+            
     def test_step(self, batch: Dict, batch_idx: int) -> None:
-        loss_dict, metrics = self._process_batch(batch)
+        if self.config.task.target == "canonical":
+            loss_dict, metrics = self._process_batch(batch, compute_hungarian=True)
         
-        # Get actual batch size (number of graphs, not nodes)
-        batch_size = len(batch['visible_mask'])
-        
-        # Use sync_dist=True for proper aggregation across GPUs in distributed setting
-        self.log('test/loss', loss_dict['total_loss'], batch_size=batch_size, sync_dist=True)
-        self.log('test/accuracy', metrics['exact_accuracy'], batch_size=batch_size, sync_dist=True)
-        self.log('test/top3_accuracy', metrics['top3_accuracy'], batch_size=batch_size, sync_dist=True)
-        self.log('test/top5_accuracy', metrics['top5_accuracy'], batch_size=batch_size, sync_dist=True)
+            # Get actual batch size (number of graphs, not nodes)
+            batch_size = len(batch['visible_mask'])
+            
+            # Use sync_dist=True for proper aggregation across GPUs in distributed setting
+            self.log('test/loss', loss_dict['total_loss'], batch_size=batch_size, sync_dist=True)
+            self.log('test/accuracy', metrics['exact_accuracy'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top3_accuracy', metrics['top3_accuracy'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top5_accuracy', metrics['top5_accuracy'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top1_mass', metrics['node_avg_top1_mass'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top2_mass', metrics['node_avg_top2_mass'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top3_mass', metrics['node_avg_top3_mass'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top5_mass', metrics['node_avg_top5_mass'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top10_mass', metrics['node_avg_top10_mass'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top1_gap', metrics['node_avg_gap_top1_correct'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top1_rank', metrics['node_avg_rank_top1_correct'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top1_mass_sinkhorn', metrics['node_avg_top1_mass_sinkhorn'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top2_mass_sinkhorn', metrics['node_avg_top2_mass_sinkhorn'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top3_mass_sinkhorn', metrics['node_avg_top3_mass_sinkhorn'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top5_mass_sinkhorn', metrics['node_avg_top5_mass_sinkhorn'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top10_mass_sinkhorn', metrics['node_avg_top10_mass_sinkhorn'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top1_gap_sinkhorn', metrics['node_avg_gap_top1_correct_sinkhorn'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top1_rank_sinkhorn', metrics['node_avg_rank_top1_correct_sinkhorn'], batch_size=batch_size, sync_dist=True)
+            self.log('test/node_avg_dustbin_share', metrics['node_avg_dustbin_share'], batch_size=batch_size, sync_dist=True)
+            self.log('test/avg_nodes', metrics['avg_nodes'], batch_size=batch_size, sync_dist=True)
+            self.log("test/exact_accuracy_sum", metrics["exact_accuracy_sum"], batch_size=batch_size, reduce_fx=torch.sum, sync_dist=True)
+            self.log("test/exact_accuracy_sum_sq", metrics["exact_accuracy_sum_sq"], batch_size=batch_size, reduce_fx=torch.sum, sync_dist=True)
+            self.log("test/exact_accuracy_count", metrics["exact_accuracy_count"], batch_size=batch_size, reduce_fx=torch.sum, sync_dist=True)
+            self.log("test/top3_accuracy_sum", metrics["top3_accuracy_sum"], batch_size=batch_size, reduce_fx=torch.sum, sync_dist=True)
+            self.log("test/top3_accuracy_sum_sq", metrics["top3_accuracy_sum_sq"], batch_size=batch_size, reduce_fx=torch.sum, sync_dist=True)
+            self.log("test/top3_accuracy_count", metrics["top3_accuracy_count"], batch_size=batch_size, reduce_fx=torch.sum, sync_dist=True)
+            self.log("test/top5_accuracy_sum", metrics["top5_accuracy_sum"], batch_size=batch_size, reduce_fx=torch.sum, sync_dist=True)
+            self.log("test/top5_accuracy_sum_sq", metrics["top5_accuracy_sum_sq"], batch_size=batch_size, reduce_fx=torch.sum, sync_dist=True)
+            self.log("test/top5_accuracy_count", metrics["top5_accuracy_count"], batch_size=batch_size, reduce_fx=torch.sum, sync_dist=True)
+            if 'canonical_avg_dustbin_row_share' in metrics:
+                self.log('test/canonical_avg_dustbin_row_share', metrics['canonical_avg_dustbin_row_share'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+            if 'exact_accuracy_hungarian' in metrics:
+                self.log('test/accuracy_hungarian', metrics['exact_accuracy_hungarian'], batch_size=batch_size, sync_dist=True)
+            self.log('test/accuracy_logits', metrics['exact_accuracy_logits'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top3_accuracy_logits', metrics['top3_accuracy_logits'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top5_accuracy_logits', metrics['top5_accuracy_logits'], batch_size=batch_size, sync_dist=True)
+
+            # SuperGlue metrics (test)
+            if 'sg_exact_match_acc' in metrics:
+                self.log('test/sg_exact_match_acc', metrics['sg_exact_match_acc'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+                self.log('test/sg_num_matched', metrics['sg_num_matched'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+                self.log('test/sg_num_unmatched_rows', metrics['sg_num_unmatched_rows'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+                self.log('test/sg_num_unmatched_cols', metrics['sg_num_unmatched_cols'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+
+                self.log('test/sg_conf_matched', metrics['sg_conf_matched'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+                self.log('test/sg_conf_unmatched_rows', metrics['sg_conf_unmatched_rows'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+                self.log('test/sg_conf_unmatched_cols', metrics['sg_conf_unmatched_cols'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+
+                self.log('test/sg_loss_matched', metrics['sg_loss_matched'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+                self.log('test/sg_loss_unmatched_rows', metrics['sg_loss_unmatched_rows'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+                self.log('test/sg_loss_unmatched_cols', metrics['sg_loss_unmatched_cols'],
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+
+            # SuperGlue dustbin parameters (test)
+            self.log('test/sg_dustbin_col_score', self.loss_fn.matcher.dustbin_col_score,
+                    on_epoch=True, batch_size=batch_size, sync_dist=True)
+            if self.loss_fn.matcher.one_to_one:
+                self.log('test/sg_dustbin_row_score', self.loss_fn.matcher.dustbin_row_score,
+                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+                self.log('test/sg_dustbin_corner_score', self.loss_fn.matcher.dustbin_corner_score,
+                       on_epoch=True, batch_size=batch_size, sync_dist=True)
+        else:
+            loss_dict, metrics = self._process_batch(batch)
+            batch_size = len(batch['visible_mask'])
+            self.log('test/loss', loss_dict['total_loss'], batch_size=batch_size, sync_dist=True)
+            self.log('test/accuracy', metrics['accuracy'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top3_accuracy', metrics['top3'], batch_size=batch_size, sync_dist=True)
+            self.log('test/top5_accuracy', metrics['top5'], batch_size=batch_size, sync_dist=True)
     
-    
-    def predict_step(self, batch: Any, batch_idx: int) -> Dict:
-        """Inference on batch from dataloader."""
+    # def predict_step(self, batch: Any, batch_idx: int) -> Dict:
+    #     """Inference on batch from dataloader."""
         
-        if not (isinstance(batch, dict) and 'batch' in batch):
-            raise RuntimeError("Data must be batch from dataloader")
+    #     if not (isinstance(batch, dict) and 'batch' in batch):
+    #         raise RuntimeError("Data must be batch from dataloader")
         
-        outputs = self(batch)
+    #     outputs = self(batch)
         
-        visible_mask = batch['visible_mask']
-        log_probs = F.log_softmax(outputs['logits'], dim=-1)
-        assignments = self.matcher(log_probs, visible_mask)
+    #     visible_mask = batch['visible_mask']
+    #     log_probs = F.log_softmax(outputs['logits'], dim=-1)
+    #     assignments = self.matcher(log_probs, visible_mask)
         
-        return {
-            'predictions': assignments['hard_assignments']
-        }
+    #     return {
+    #         'predictions': assignments['hard_assignments']
+    #     }
     
     
     def configure_optimizers(self):
@@ -309,7 +534,13 @@ class LightningModel(L.LightningModule):
                 else:
                     # Any other parameters go to AdamW
                     adamw_params.append(param)
-            
+
+            # Include Sinkhorn matcher (dustbin) parameters in the optimizer.
+            # TODO: Check if we should keep dustbin scores
+            # These are scalars / 1D, so they should be handled by the AdamW part of Muon.
+            if self.config.task.target == "canonical":
+                adamw_params.extend(self.loss_fn.matcher.parameters())
+
             adamw_lr = opt_config.muon_adamw_lr if opt_config.muon_adamw_lr is not None else opt_config.learning_rate
             
             use_bfloat16 = self.config.system.mixed_precision in ["bf16", "bf16-mixed"]
@@ -481,7 +712,9 @@ def train(config: Config, train_loader, val_loader=None, test_loader=None, resum
     
     trainer = create_trainer(config)
     
-    trainer.fit(model, train_loader, val_loader, ckpt_path=resume_from)
+    # trainer.fit(model, train_loader, val_loader, ckpt_path=resume_from)
+    # TODO: This now restarts the optimizer state, which is not "true finetuning." It is used for superglue finetuning, but it is not how original finetuning worked!
+    trainer.fit(model, train_loader, val_loader) # I gotta check if this is the right way to go!
     
     if test_loader:
         trainer.test(model, test_loader)

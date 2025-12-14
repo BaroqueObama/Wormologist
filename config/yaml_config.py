@@ -5,7 +5,7 @@ from config.config import (
     Config, ModelConfig, TrainingConfig, OptimizerConfig, 
     SchedulerConfig, SinkhornConfig, LossConfig, DataConfig,
     AugmentationConfig, CurriculumConfig, GraphConfig, 
-    SystemConfig, StorageConfig, ExperimentConfig
+    SystemConfig, StorageConfig, ExperimentConfig, TaskConfig
 )
 
 
@@ -53,7 +53,8 @@ def load_yaml_config(path: Union[str, Path]) -> Config:
         'graph': GraphConfig,
         'system': SystemConfig,
         'storage': StorageConfig,
-        'experiment': ExperimentConfig
+        'experiment': ExperimentConfig,
+        'task': TaskConfig,
     }
     
     config = Config()

@@ -15,6 +15,7 @@ class DataAugmentation:
     def __init__(self, config):
         self.config = config
         self.enabled = config.enabled
+        self.normalize_z_axis_enabled = getattr(config, "normalize_z_axis", True)
         
         # Z-shift parameters
         self.z_shift_range = config.z_shift_range
@@ -40,7 +41,12 @@ class DataAugmentation:
         self.post_rotation_xy_scale_beta_alpha = config.post_rotation_xy_scale_beta_alpha
         self.post_rotation_xy_scale_beta_beta = config.post_rotation_xy_scale_beta_beta
         self.xy_scale_orientation_range = config.xy_scale_orientation_range
-        
+
+        # XY jitter parameters (optional planar translation)
+        self.xy_jitter_mode = getattr(config, "xy_jitter_mode", "none")  # "none", "normal", or "uniform"
+        self.xy_jitter_std = getattr(config, "xy_jitter_std", 0.0)       # used when mode == "normal"
+        self.xy_jitter_range = getattr(config, "xy_jitter_range", 0.0)   # half-width when mode == "uniform"
+
         # Control parameters
         self.apply_to_splits = config.apply_to_splits
         self.base_seed = config.seed
@@ -132,6 +138,41 @@ class DataAugmentation:
         result = torch.cat([xy_final, z_coords], dim=1)
         return result
     
+    def apply_xy_jitter(self, coords: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+        """Apply a small translation in the xy plane; z is untouched.
+
+        The configured std/range are interpreted as fractions of the current xy span.
+        """
+
+        xy_max = coords[:, :2].max(dim=0).values
+        xy_min = coords[:, :2].min(dim=0).values
+        xy_span = (xy_max - xy_min).clamp_min(1e-6)
+
+        if self.xy_jitter_mode == "normal" and self.xy_jitter_std > 0:
+            scale = self.xy_jitter_std * xy_span
+            noise = torch.randn(
+                (coords.size(0), 2),
+                generator=generator,
+                device=coords.device,
+                dtype=coords.dtype,
+            ) * scale
+        elif self.xy_jitter_mode == "uniform" and self.xy_jitter_range > 0:
+            half_width = self.xy_jitter_range * xy_span
+            noise = (
+                torch.empty(
+                    coords.size(0), 2,
+                    device=coords.device,
+                    dtype=coords.dtype,
+                    generator=generator,
+                ).uniform_(-1.0, 1.0)
+                * half_width
+            )
+        else:
+            return coords
+
+        out = coords.clone()
+        out[:, :2] += noise
+        return out
     
     def augment(self, coords: torch.Tensor, specimen_idx: int, split: str = "train") -> torch.Tensor:
         if not self.should_augment(split):
@@ -140,7 +181,8 @@ class DataAugmentation:
         generator = self._get_generator(specimen_idx)
         
         # Normalize z-axis
-        coords = self.normalize_z_axis(coords)
+        if self.normalize_z_axis_enabled:
+            coords = self.normalize_z_axis(coords)
 
         # Apply z-shift
         if self.z_shift_distribution == "beta":
@@ -172,5 +214,9 @@ class DataAugmentation:
         orientation_deg = self._sample_uniform(self.xy_scale_orientation_range[0], self.xy_scale_orientation_range[1], generator)
         orientation_rad = np.deg2rad(orientation_deg)
         coords = self.apply_post_rotation_xy_scaling(coords, xy_scale, orientation_rad)
+
+        # XY planar jitter (adds a small translation in the xy plane)
+        if self.xy_jitter_mode != "none":
+            coords = self.apply_xy_jitter(coords, generator)
         
         return coords

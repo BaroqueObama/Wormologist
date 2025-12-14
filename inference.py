@@ -17,6 +17,11 @@ from model.lightning_model import LightningModel
 import pickle
 import json
 
+from dataclasses import asdict
+import json
+from config.config import AugmentationConfig
+import math
+
 
 def handle_state_dict_gpu_mismatch(state_dict: dict, remove_module_prefix: bool = True) -> dict:
     """Handle state dict from multi-GPU training for single GPU or different GPU inference."""
@@ -320,16 +325,69 @@ def test_inference(test_file_path, checkpoint_path):
 
     return {"samples": all_results, "metrics": metrics}
 
-# Helper to find all subgraph datasets
+# # Helper to find all subgraph datasets
+# def _discover_subgraph_datasets(subgraph_root: Union[str, Path]) -> List[Path]:
+#     subgraph_root = Path(subgraph_root)
+#     dataset_dirs: List[Path] = []
+#     for candidate in sorted(subgraph_root.glob("subgraph_*")):
+#         test_dir = candidate / "test"
+#         if test_dir.is_dir():
+#             dataset_dirs.append(candidate)
+#     if not dataset_dirs:
+#         raise ValueError(f"No subgraph_* directories with a test/ split found under {subgraph_root}")
+#     return dataset_dirs
+
+
 def _discover_subgraph_datasets(subgraph_root: Union[str, Path]) -> List[Path]:
+    """
+    Find every dataset folder directly under `subgraph_root` that exposes a `test/`
+    split containing at least one HDF5 shard. Works for both
+    `sliced_subgraphs_shift_*` and `dataset_*` layouts:
+
+        subgraph_root/
+            <any-name>/
+                test/
+                    *.h5
+    """
     subgraph_root = Path(subgraph_root)
     dataset_dirs: List[Path] = []
-    for candidate in sorted(subgraph_root.glob("subgraph_*")):
+
+    for candidate in sorted(subgraph_root.iterdir()):
+        if not candidate.is_dir():
+            continue
         test_dir = candidate / "test"
-        if test_dir.is_dir():
+        if test_dir.is_dir() and any(test_dir.glob("*.h5")):
             dataset_dirs.append(candidate)
+
     if not dataset_dirs:
-        raise ValueError(f"No subgraph_* directories with a test/ split found under {subgraph_root}")
+        raise ValueError(
+            f"No dataset folders with a test/ split found under {subgraph_root}"
+        )
+    return dataset_dirs
+
+def _discover_shifted_subgraph_datasets(subgraph_root: Union[str, Path]) -> List[Path]:
+    """
+    Find all sliced-subgraph datasets under `subgraph_root` following the pattern:
+
+        subgraph_root/
+            sliced_subgraphs_shift_<offset>/
+                test/
+                    *.h5
+
+    Returns the list of directories (each one passed to `create_data_loader`).
+    """
+    subgraph_root = Path(subgraph_root)
+    dataset_dirs: List[Path] = []
+
+    for candidate in sorted(subgraph_root.glob("sliced_subgraphs_shift_*")):
+        test_dir = candidate / "test"
+        if test_dir.is_dir() and any(test_dir.glob("*.h5")):
+            dataset_dirs.append(candidate)
+
+    if not dataset_dirs:
+        raise ValueError(
+            f"No sliced_subgraphs_shift_* directories with a test/ split found under {subgraph_root}"
+        )
     return dataset_dirs
 
 
@@ -346,6 +404,12 @@ def run_subgraph_suite(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, config = load_model_from_checkpoint(checkpoint_path, device=device)
 
+    # # Check if this makes sense
+    # #################################################
+    # model.loss_fn.matcher.temperature = config.sinkhorn.final_temperature
+    # model.matcher.temperature = config.sinkhorn.final_temperature
+    # print(f"Eval Sinkhorn temperature: {model.matcher.temperature}")
+    # #################################################
     trainer = L.Trainer(
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
@@ -365,6 +429,19 @@ def run_subgraph_suite(
             results_file = results_file / "subgraph_metrics.json"
         results_file.parent.mkdir(parents=True, exist_ok=True)
 
+    # This should be instantiated elsewhere/more modularly (maybe)
+    
+    # aug_cfg = AugmentationConfig(
+    #     apply_to_splits=["test"],
+    #     z_shift_range=[0.02, 0.02], # same as [0.02, 0.020000001]
+    #     # z_shift_range=[1.0, 1.0], # was just a sanity check that the transformation is 
+    #     # z_shift_range=[0.0, 0.0], # another sanity check, but there is slight difference due to: normalize_z_axis. Does this imply anything about my slicing? Does this z normalization to zero make sense with subgraphs?
+    #     uniform_scale_range=[1.0, 1.0],
+    #     z_rotation_range=[0.0, 0.0],
+    #     post_rotation_xy_scale_range=[1.0, 1.0],
+    #     xy_scale_orientation_range=[0.0, 0.0],
+    # )
+    # print(json.dumps(asdict(aug_cfg), indent=2))
 
     for dataset_dir in _discover_subgraph_datasets(subgraph_root):
         loader = create_data_loader(
@@ -374,7 +451,7 @@ def run_subgraph_suite(
             coordinate_system=config.data.coordinate_system,
             normalize_coords=config.data.normalize_coords,
             use_cell_type_features=config.data.use_cell_type_features,
-            augmentation_config=None,          # disable augmentations
+            augmentation_config=None,  # aug_cfg,  # No augmentation during testing        
             num_workers=0,
             distributed=False,
             shuffle_shards=False,
@@ -390,17 +467,201 @@ def run_subgraph_suite(
             with results_file.open("w") as handle:
                 json.dump(results, handle, indent=2)
 
+    if results_file is not None and results:
+        summary: Dict[str, float] = {}
+        metric_keys = set().union(*(metrics.keys() for metrics in results.values()))
+        for key in metric_keys:
+            values = [
+                float(split_metrics[key])
+                for split_metrics in results.values()
+                if isinstance(split_metrics.get(key), (int, float))
+            ]
+            if not values:
+                continue
+            mean_val = sum(values) / len(values)
+            if len(values) > 1:
+                variance = sum((v - mean_val) ** 2 for v in values) / (len(values) - 1)
+                std_val = variance ** 0.5
+            else:
+                std_val = 0.0
+            summary[f"{key}/mean"] = mean_val
+            summary[f"{key}/std"] = std_val
+
+        # New aggregation goes here:
+        acc_totals: Dict[str, Dict[str, float]] = {}
+        for split_metrics in results.values():
+            for name, value in split_metrics.items():
+                if not isinstance(value, (int, float)):
+                    continue
+                for suffix, bucket in [("_sum", "sum"), ("_sum_sq", "sum_sq"), ("_count", "count")]:
+                    if name.endswith(suffix):
+                        base = name[: -len(suffix)]
+                        acc_totals.setdefault(base, {"sum": 0.0, "sum_sq": 0.0, "count": 0.0})
+                        acc_totals[base][bucket] += float(value)
+                        break
+
+        for base, totals in acc_totals.items():
+            count = totals["count"]
+            total_sum = totals["sum"]
+            total_sq = totals["sum_sq"]
+            if count <= 0:
+                continue
+            mean_val = total_sum / count
+            if count > 1:
+                variance = (total_sq - (total_sum ** 2) / count) / (count - 1)
+                std_val = math.sqrt(max(variance, 0.0))
+            else:
+                std_val = 0.0
+            summary[f"{base}/global_mean"] = mean_val
+            summary[f"{base}/global_std"] = std_val
+
+        summary_file = results_file.with_name("metrics_summary.json")
+        with summary_file.open("w") as handle:
+            json.dump(summary, handle, indent=2)
 
     return results
 
+
+def _compute_unbiased_std(total_sum: float, total_sq: float, count: float) -> float:
+    if count <= 1:
+        return 0.0
+    variance = (total_sq - (total_sum ** 2) / count) / (count - 1)
+    return math.sqrt(max(variance, 0.0))
+
+def run_single_subgraph(
+    subgraph_path: Union[str, Path],
+    checkpoint_path: Union[str, Path],
+    results_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, float]:
+    """
+    Evaluate a single subgraph dataset (directory or individual shard) with the
+    same machinery used by run_subgraph_suite.
+    """
+    dataset_path = Path(subgraph_path).expanduser().resolve()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, config = load_model_from_checkpoint(checkpoint_path, device=device)
+
+    trainer = L.Trainer(
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_model_summary=False,
+        enable_progress_bar=True,
+        inference_mode=True,
+    )
+
+    # Determine whether we were given a directory (with split subfolders) or a single shard.
+    if dataset_path.suffix.lower() in {".h5", ".hdf5"}:
+        split_name = dataset_path.parent.name              # e.g. "test"
+        data_root = dataset_path.parent.parent             # directory that holds the split folders
+        single_shard = dataset_path
+    else:
+        data_root = dataset_path
+        split_name = "test"
+        single_shard = None
+
+    loader = create_data_loader(
+        data_path=data_root,
+        split=split_name,
+        batch_size=config.training.micro_batch_size,
+        coordinate_system=config.data.coordinate_system,
+        normalize_coords=config.data.normalize_coords,
+        use_cell_type_features=config.data.use_cell_type_features,
+        augmentation_config=None,
+        num_workers=0,
+        distributed=False,
+        shuffle_shards=False,
+        shuffle_within_shard=False,
+    )
+
+    if single_shard is not None:
+        loader.dataset.shard_files = [single_shard]
+
+    metrics_list = trainer.test(model, dataloaders=loader, ckpt_path=None, verbose=False)
+    metrics = metrics_list[0] if metrics_list else {}
+    print(f"{dataset_path.name}: {metrics}")
+    
+    if results_path is not None:
+        results_file = Path(results_path)
+        if results_file.is_dir():
+            results_file = results_file / f"{dataset_path.stem}_metrics.json"
+        results_file.parent.mkdir(parents=True, exist_ok=True)
+
+        with results_file.open("w") as handle:
+            json.dump(metrics, handle, indent=2)
+
+        # write a metrics summary like run_subgraph_suite
+        summary = {
+            "test/exact_accuracy/global_mean": metrics["test/exact_accuracy_sum"] / metrics["test/exact_accuracy_count"],
+            "test/exact_accuracy/global_std": _compute_unbiased_std(
+                metrics["test/exact_accuracy_sum"],
+                metrics["test/exact_accuracy_sum_sq"],
+                metrics["test/exact_accuracy_count"],
+            ),
+            "test/top3_accuracy/global_mean": metrics["test/top3_accuracy_sum"] / metrics["test/top3_accuracy_count"],
+            "test/top3_accuracy/global_std": _compute_unbiased_std(
+                metrics["test/top3_accuracy_sum"],
+                metrics["test/top3_accuracy_sum_sq"],
+                metrics["test/top3_accuracy_count"],
+            ),
+            "test/top5_accuracy/global_mean": metrics["test/top5_accuracy_sum"] / metrics["test/top5_accuracy_count"],
+            "test/top5_accuracy/global_std": _compute_unbiased_std(
+                metrics["test/top5_accuracy_sum"],
+                metrics["test/top5_accuracy_sum_sq"],
+                metrics["test/top5_accuracy_count"],
+            ),
+        }
+
+        summary_file = results_file.with_name("metrics_summary.json")
+        with summary_file.open("w") as handle:
+            json.dump(summary, handle, indent=2)
+
+    return metrics
+
 if __name__ == "__main__":
-    # test_file_path = "/fs/pool/pool-mlsb/bulat/Wormologist/subgraph_testing_data/pool_subgraph_testing_data/subgraph_100.pkl"
+    # test_file_path = "/fs/pool/pool-mlsb/bulat/Wormologist/graph_matching/sliced_subgraphs_for_inference.pkl"
     # # checkpoint_path = "/fs/pool/pool-mlsb/bulat/Wormologist/Baseline_Multiscale/Baseline_Multiscale/last.ckpt"
-    # checkpoint_path = "/fs/pool/pool-mlsb/bulat/Wormologist/checkpoint_all_reproduce/Reproduce/last.ckpt"
+    # checkpoint_path = "/fs/pool/pool-mlsb/bulat/Wormologist/checkpoint_three_cell_types/Three_Cell_Types/last.ckpt"
 
     # test_inference(test_file_path, checkpoint_path)
-    subgraph_root = "/fs/pool/pool-mlsb/bulat/Wormologist/new_subgraph_testing_data"
-    checkpoint_path = "/fs/pool/pool-mlsb/bulat/Wormologist/checkpoint_all_reproduce/Reproduce/last.ckpt"
-    results_path = "/fs/pool/pool-mlsb/bulat/Wormologist/redefined_testing_results/6_cell_types"
+    # subgraph_root = "/fs/pool/pool-mlsb/bulat/Wormologist/new_subgraph_testing_data_sliced_shift_projected_20_slices"
+    # checkpoint_path = "/fs/pool/pool-mlsb/bulat/Wormologist/checkpoint_three_cell_types/Three_Cell_Types/last.ckpt"
+    # results_path = "/fs/pool/pool-mlsb/bulat/Wormologist/redefined_testing_results/3_cell_types_shift_20_slices_projected/metrics.json"
 
-    run_subgraph_suite(subgraph_root, checkpoint_path, results_path)
+    # run_subgraph_suite(subgraph_root, checkpoint_path, results_path)
+
+    # run_single_subgraph(
+    # "/fs/pool/pool-mlsb/bulat/Wormologist/new_subgraph_testing_data_sliced/sliced_subgraphs/test/test_0000.h5",
+    # checkpoint_path="/fs/pool/pool-mlsb/bulat/Wormologist/checkpoint_three_cell_types/Three_Cell_Types/last.ckpt",)
+    
+    # checkpoint_path = Path("/fs/pool/pool-mlsb/bulat/Wormologist/checkpoint_three_cell_types_one_to_one_sliced_data_2/Three_Cell_Types_one_to_one_sliced_data_2/last.ckpt")
+    # parent_root = Path("/fs/pool/pool-mlsb/bulat/Wormologist/real_test_set")
+
+    # for subgraph_dir in sorted(parent_root.iterdir()):
+    #     if not subgraph_dir.is_dir():
+    #         continue  # skip stray files
+
+    #     subgraph_root = subgraph_dir
+    #     results_path = subgraph_dir / "results_one_to_one_sliced_data_2" / "metrics.json"
+
+    #     results_path.parent.mkdir(parents=True, exist_ok=True)
+
+    #     run_subgraph_suite(
+    #         subgraph_root=subgraph_root,
+    #         checkpoint_path=checkpoint_path,
+    #         results_path=results_path,
+    #     )
+
+#     run_single_subgraph(
+#     subgraph_path=Path("/fs/pool/pool-mlsb/bulat/Wormologist/new_subgraph_testing_data/subgraph_558"),
+#     checkpoint_path=Path("/fs/pool/pool-mlsb/bulat/Wormologist/checkpoint_three_cell_types_one_to_one_sliced_data/Three_Cell_Types_one_to_one_sliced_data/last.ckpt"),
+#     results_path=Path("/fs/pool/pool-mlsb/bulat/Wormologist/new_subgraph_testing_data/subgraph_558/metrics_one_to_one_sliced_data.json"),
+# )
+
+    run_subgraph_suite(
+    subgraph_root=Path("/fs/pool/pool-mlsb/bulat/Wormologist/random_comparison_to_real_test_set_40"),
+    checkpoint_path=Path("/fs/pool/pool-mlsb/bulat/Wormologist/model_checkpoints/checkpoint_three_cell_types_one_to_one_sliced_data/Three_Cell_Types_one_to_one_sliced_data/last.ckpt"),
+    results_path=Path("/fs/pool/pool-mlsb/bulat/Wormologist/random_comparison_to_real_test_set_40/one_to_one_sliced_data/metrics_with_hungarian3.json"),
+)
