@@ -29,6 +29,16 @@ class Wormologist(nn.Module):
             nn.Dropout(config.dropout),
             nn.Linear(config.hidden_dim // 2, config.out_dim)
         )
+
+        if config.cell_type_out_dim and config.cell_type_out_dim > 0:
+            self.cell_type_head = nn.Sequential(
+                nn.Linear(config.hidden_dim, config.hidden_dim),
+                SwiGLU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(config.hidden_dim // 2, config.cell_type_out_dim)
+            )
+        else:
+            self.cell_type_head = None
     
     
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: Optional[torch.Tensor] = None, batch: torch.Tensor = None) -> Dict[str, torch.Tensor]:
@@ -59,7 +69,11 @@ class Wormologist(nn.Module):
             x, edge_attr = layer(x, edge_index, edge_attr, batch)
         
         logits = self.classification_head(x)  # [num_nodes, 558]
-        
+
+        cell_type_logits = None
+        if self.cell_type_head is not None:
+            cell_type_logits = self.cell_type_head(x)  # [num_nodes, 7]
+
         batch_size = batch.max().item() + 1
         
         max_nodes = 0
@@ -82,5 +96,14 @@ class Wormologist(nn.Module):
         outputs = {
             "logits": batched_logits,
         }
+        if cell_type_logits is not None:
+            batched_ct = torch.zeros(batch_size, max_nodes, self.cell_type_head[-1].out_features,
+                                     device=logits.device, dtype=logits.dtype)
+            for b in range(batch_size):
+                mask = (batch == b)
+                n = mask.sum().item()
+                if n > 0:
+                    batched_ct[b, :n] = cell_type_logits[mask]
+            outputs["cell_type_logits"] = batched_ct
         
         return outputs

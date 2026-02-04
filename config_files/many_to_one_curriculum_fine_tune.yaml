@@ -1,5 +1,5 @@
 experiment:
-  experiment_name: "Three_Cell_Types_one_to_one_sliced_data" # to modify for each experiment
+  experiment_name: "Three_Cell_Types_many_to_one_curriculum_finetune" # to modify for each experiment
   wandb_project: "celegans"
   wandb_tags: ["accurate", "muon", "yaml", "no_curr", "rot_invar"]
   log_interval: 10
@@ -45,9 +45,9 @@ training:
   micro_batch_size: 2 # Adjust size to fit in GPU memory
   epochs: 1
   gradient_clip_val: 1.0
-  val_check_interval: 256
+  val_check_interval: 64
   limit_val_batches: 64
-  checkpoint_interval: 256
+  checkpoint_interval: 64
   seed: 42
 
 
@@ -76,20 +76,20 @@ optimizer:
 
 scheduler:
   scheduler_type: "cosine"  # "cosine", "linear", "constant"
-  warmup_batches: 512           # Warmup for 512 batches
+  warmup_batches: 128           # Warmup for 512 batches
   warmup_start_lr: 1.0e-6       # Start from 1e-6
   min_lr: 0.0005              # End at after cosine decay
-  total_training_batches: 32768 # 16384
+  total_training_batches: 8192 # 16384
 
 
 sinkhorn:
   num_iterations: 5
   init_temperature: 1.0
   final_temperature: 0.01
-  temperature_warmup_steps: 100
+  temperature_warmup_steps: 25
   dustbin_weight: 1.0
   epsilon: 1e-8
-  one_to_one: true # one-to-one matching
+  one_to_one: false # many-to-one matching
 
 
 loss:
@@ -132,25 +132,30 @@ augmentation:
 
 curriculum:
   enabled: true
-  start_visibility: 1.0
-  end_visibility: 0.15
-  warmup_batches: 128
-  curriculum_batches: 512
-  cooldown_batches: 32768
-  train_distribution: "beta"
-  curriculum_beta_alpha: 0.9  # Alpha parameter for curriculum phase
-  curriculum_beta_beta: 1.6   # Beta parameter for curriculum phase
-  cooldown_beta_alpha: 1.0    # Alpha parameter for cooldown phase
-  cooldown_beta_beta: 2.0     # Beta parameter for cooldown phase
-  truncated_std: 0.1
-  val_distribution: "uniform"
-  val_min_visibility: 0.18
-  val_max_visibility: 0.22
-  seed: 42
+  subgraph_strategy: sliced
+  slice_max_n_slices: 40
+  start_visibility: 1.0          # 40 slices at the start
+  end_visibility: 0.5            # 0.5 × 40 = 20 slices at the end
+  warmup_batches: 32
+  curriculum_batches: 128
+  cooldown_batches: 8192
+  train_distribution: beta       # keeps the same skew you tuned before
+  curriculum_beta_alpha: 0.9
+  curriculum_beta_beta: 1.6
+  cooldown_beta_alpha: 1.0
+  cooldown_beta_beta: 2.0
+  slice_profiles:
+    - {thickness_fraction: 0.007, crop_fraction_range: [0.5, 1.0]}
+    - {thickness_fraction: 0.008, crop_fraction_range: [0.0, 1.0]}
+    - {thickness_fraction: 0.009, crop_fraction_range: [0.0, 0.5]}
+  slice_crop_axis: random
+  slice_seed: 42
+  val_min_visibility: 0.5
+  val_max_visibility: 0.5
 
 
 data:
-  data_path: "/fs/pool/pool-mlsb/bulat/Wormologist/data_all_reproduce/long_train" # sometimes modify
+  data_path: "/fs/pool/pool-mlsb/bulat/Wormologist/data_finetune/finetune" # sometimes modify
   coordinate_system: "cylindrical"  # "cartesian" or "cylindrical"
   normalize_coords: false  # Disabled to avoid issues with subgraphs
   use_cell_type_features: true  # Include one-hot encoded cell type features
@@ -173,7 +178,7 @@ system:
 
 storage:
   # Custom storage directories
-  checkpoint_dir: "/fs/pool/pool-mlsb/bulat/Wormologist/checkpoint_three_cell_types_one_to_one_sliced_data"  # modify for each experiment
-  wandb_dir: "/fs/pool/pool-mlsb/bulat/Wormologist/wandb_three_cell_types_one_to_one_sliced_data"  # modify for each experiment
+  checkpoint_dir: "/fs/pool/pool-mlsb/bulat/Wormologist/checkpoint_three_cell_types_many_to_one_curriculum_finetune"  # modify for each experiment
+  wandb_dir: "/fs/pool/pool-mlsb/bulat/Wormologist/wandb_three_cell_types_many_to_one_curriculum_finetune"  # modify for each experiment
   use_experiment_subdir: true  # Create subdirectory with experiment name
   save_config_copy: true  # Save a copy of the config with checkpoints

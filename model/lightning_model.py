@@ -9,7 +9,7 @@ import math
 
 from loader.graph_encoder import GraphEncoder
 from loader.coordinate_encoder import CoordinateEncoder
-from loader.cell_types import NUM_CELL_TYPES
+from loader.cell_types import NUM_CELL_TYPES, CELL_TYPES_FINE
 from model.model import Wormologist
 from model.pe import PEModule
 from model.multiscale_pe import MultiScaleRRWPFiltration
@@ -65,6 +65,9 @@ class LightningModel(L.LightningModule):
             node_input_dim=node_input_dim,
             edge_input_dim=edge_input_dim
         )
+
+        self.cell_type_loss_weight = config.loss.cell_type_loss_weight
+        self.ce_loss_celltype = nn.CrossEntropyLoss(label_smoothing=config.loss.label_smoothing)
         
         if config.task.target == "canonical":
             # Loss computation
@@ -195,6 +198,25 @@ class LightningModel(L.LightningModule):
             loss_dict = self.loss_fn(outputs, targets)
             metrics = compute_assignment_accuracy(outputs, targets, loss_dict['soft_assignments'], dustbin_weights=loss_dict.get('dustbin_weights', None), dustbin_row_weights=loss_dict.get('dustbin_row_weights', None), compute_hungarian=compute_hungarian, full_assignments=loss_dict.get('full_assignments', None))
 
+            if self.cell_type_loss_weight > 0:
+                if "cell_type_logits" not in outputs:
+                    raise RuntimeError("cell_type_logits missing from model outputs")
+                ct_logits = outputs["cell_type_logits"]
+                visible_mask = targets['visible_mask'].bool()
+                # map canonical labels -> cell-type labels
+                labels_cpu = targets['labels'].detach().cpu().numpy()
+                ct_np = CELL_TYPES_FINE[labels_cpu]
+                ct_labels = torch.as_tensor(ct_np, device=ct_logits.device, dtype=torch.long)
+                flat_logits = ct_logits[visible_mask]
+                flat_labels = ct_labels[visible_mask]
+                ct_loss = self.ce_loss_celltype(flat_logits, flat_labels)
+                with torch.no_grad():
+                    preds = flat_logits.argmax(dim=-1)
+                    ct_acc = (preds == flat_labels).float().mean()
+                loss_dict['cell_type_loss'] = ct_loss
+                loss_dict['total_loss'] = loss_dict['total_loss'] + self.cell_type_loss_weight * ct_loss
+                metrics['cell_type_accuracy'] = ct_acc
+
             return loss_dict, metrics
 
         else:
@@ -298,6 +320,10 @@ class LightningModel(L.LightningModule):
                 self.log('multiscale/sigma_max', sigmas.max().item(), on_step=True, batch_size=batch_size)
                 self.log('multiscale/sigma_range', (sigmas.max() - sigmas.min()).item(), on_step=True, batch_size=batch_size)
             
+            if 'cell_type_loss' in loss_dict:
+                self.log('train/cell_type_loss', loss_dict['cell_type_loss'], on_step=True, batch_size=batch_size)
+                self.log('train/cell_type_accuracy', metrics['cell_type_accuracy'], on_step=True, batch_size=batch_size)
+
             return loss_dict['total_loss']
         else:
             loss_dict, metrics = self._process_batch(batch)
@@ -382,6 +408,11 @@ class LightningModel(L.LightningModule):
             self.log('val/accuracy_logits', metrics['exact_accuracy_logits'], batch_size=batch_size, sync_dist=True)
             self.log('val/top3_accuracy_logits', metrics['top3_accuracy_logits'], batch_size=batch_size, sync_dist=True)
             self.log('val/top5_accuracy_logits', metrics['top5_accuracy_logits'], batch_size=batch_size, sync_dist=True)
+
+            if 'cell_type_loss' in loss_dict:
+                self.log('val/cell_type_loss', loss_dict['cell_type_loss'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+                self.log('val/cell_type_accuracy', metrics['cell_type_accuracy'], on_epoch=True, batch_size=batch_size, sync_dist=True)
+
         else:
             loss_dict, metrics = self._process_batch(batch)
             batch_size = len(batch['visible_mask'])
@@ -469,6 +500,11 @@ class LightningModel(L.LightningModule):
                         on_epoch=True, batch_size=batch_size, sync_dist=True)
                 self.log('test/sg_dustbin_corner_score', self.loss_fn.matcher.dustbin_corner_score,
                        on_epoch=True, batch_size=batch_size, sync_dist=True)
+        
+            if 'cell_type_loss' in loss_dict:
+                self.log('test/cell_type_loss', loss_dict['cell_type_loss'], batch_size=batch_size, sync_dist=True)
+                self.log('test/cell_type_accuracy', metrics['cell_type_accuracy'], batch_size=batch_size, sync_dist=True)
+
         else:
             loss_dict, metrics = self._process_batch(batch)
             batch_size = len(batch['visible_mask'])
@@ -538,8 +574,8 @@ class LightningModel(L.LightningModule):
             # Include Sinkhorn matcher (dustbin) parameters in the optimizer.
             # TODO: Check if we should keep dustbin scores
             # These are scalars / 1D, so they should be handled by the AdamW part of Muon.
-            if self.config.task.target == "canonical":
-                adamw_params.extend(self.loss_fn.matcher.parameters())
+            # if self.config.task.target == "canonical":
+            #     adamw_params.extend(self.loss_fn.matcher.parameters())
 
             adamw_lr = opt_config.muon_adamw_lr if opt_config.muon_adamw_lr is not None else opt_config.learning_rate
             

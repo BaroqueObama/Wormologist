@@ -1,5 +1,5 @@
 experiment:
-  experiment_name: "Three_Cell_Types_one_to_one_sliced_data" # to modify for each experiment
+  experiment_name: "Three_Cell_Types_one_to_one_sliced_data_wo_sinkhorn_reg" # to modify for each experiment
   wandb_project: "celegans"
   wandb_tags: ["accurate", "muon", "yaml", "no_curr", "rot_invar"]
   log_interval: 10
@@ -132,21 +132,29 @@ augmentation:
 
 curriculum:
   enabled: true
-  start_visibility: 1.0
-  end_visibility: 0.15
+  subgraph_strategy: sliced
+  slice_max_n_slices: 125
+  start_visibility: 1.0          
+  end_visibility: 0.05            # 0.16 × 125 = 20 slices at the end
   warmup_batches: 128
   curriculum_batches: 512
   cooldown_batches: 32768
-  train_distribution: "beta"
-  curriculum_beta_alpha: 0.9  # Alpha parameter for curriculum phase
-  curriculum_beta_beta: 1.6   # Beta parameter for curriculum phase
-  cooldown_beta_alpha: 1.0    # Alpha parameter for cooldown phase
-  cooldown_beta_beta: 2.0     # Beta parameter for cooldown phase
-  truncated_std: 0.1
+  train_distribution: beta       # keeps the same skew you tuned before
+  curriculum_beta_alpha: 0.9
+  curriculum_beta_beta: 1.6
+  cooldown_beta_alpha: 1.0
+  cooldown_beta_beta: 2.0
+  slice_profiles:
+    - {thickness_fraction: 0.007, crop_fraction_range: [0.5, 1.0]}
+    - {thickness_fraction: 0.008, crop_fraction_range: [0.0, 1.0]}
+    - {thickness_fraction: 0.009, crop_fraction_range: [0.0, 0.5]}
+  slice_crop_axis: random
+  slice_seed: 42
+  val_min_visibility: 0.16
+  val_max_visibility: 0.32
   val_distribution: "uniform"
-  val_min_visibility: 0.18
-  val_max_visibility: 0.22
-  seed: 42
+  truncated_std: 0.1
+  interpolate_crop_fraction: true # True for full training
 
 
 data:
@@ -173,7 +181,7 @@ system:
 
 storage:
   # Custom storage directories
-  checkpoint_dir: "/fs/pool/pool-mlsb/bulat/Wormologist/checkpoint_three_cell_types_one_to_one_sliced_data"  # modify for each experiment
-  wandb_dir: "/fs/pool/pool-mlsb/bulat/Wormologist/wandb_three_cell_types_one_to_one_sliced_data"  # modify for each experiment
+  checkpoint_dir: "/fs/pool/pool-mlsb/bulat/Wormologist/model_checkpoints/checkpoint_three_cell_types_one_to_one_sliced_data_wo_sinkhorn_reg"  # modify for each experiment
+  wandb_dir: "/fs/pool/pool-mlsb/bulat/Wormologist/wandb_three_cell_types_one_to_one_sliced_data_wo_sinkhorn_reg"  # modify for each experiment
   use_experiment_subdir: true  # Create subdirectory with experiment name
   save_config_copy: true  # Save a copy of the config with checkpoints

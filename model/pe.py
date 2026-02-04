@@ -55,7 +55,7 @@ class PEModule(nn.Module):
         return node_pe, edge_pe
 
 
-# TODO: Not used, consider deprecating
+# NOTE: Currently disabled (use_degree_scaler=False by default). Kept for potential future use.
 class DegreeScaler(nn.Module):
     """Inject degree information into node representations"""
     

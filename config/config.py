@@ -55,11 +55,12 @@ class ModelConfig:
     attn_dropout: float = 0.0
     dropout: float = 0.0
     
-    # Degree information (should deprecate)
+    # Degree information (disabled by default, kept for potential future experiments)
     use_degree_scaler: bool = False
     
     # Output
     out_dim: int = 558
+    cell_type_out_dim: int = 0  # Number of cell types (for cell_type task)
     
     def __post_init__(self):
         # Set default MLA layers if not specified (use MLA for later half of layers)
@@ -151,6 +152,7 @@ class LossConfig:
     # Flags for Sinkhorn finetuning
     use_topk_sinkhorn_mask: bool = False
     topk_sinkhorn_k: int = 5
+    cell_type_loss_weight: float = 0.0  # Weight for auxiliary cell type classification loss
 
 @dataclass
 class AugmentationConfig:

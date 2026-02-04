@@ -1,5 +1,5 @@
 experiment:
-  experiment_name: "Three_Cell_Types_one_to_one_sliced_data" # to modify for each experiment
+  experiment_name: "Three_Cell_Types_one_to_one_random_data_superglue_loss_fixed5" # to modify for each experiment
   wandb_project: "celegans"
   wandb_tags: ["accurate", "muon", "yaml", "no_curr", "rot_invar"]
   log_interval: 10
@@ -83,10 +83,10 @@ scheduler:
 
 
 sinkhorn:
-  num_iterations: 5
+  num_iterations: 50 # it used to be 5
   init_temperature: 1.0
-  final_temperature: 0.01
-  temperature_warmup_steps: 100
+  final_temperature: 1.0 # used to be 0.01
+  temperature_warmup_steps: 0 # used to be 100
   dustbin_weight: 1.0
   epsilon: 1e-8
   one_to_one: true # one-to-one matching
@@ -97,6 +97,7 @@ loss:
   assignment_weight: 1.0
   label_smoothing: 0.1
   worm_averaged_loss: true
+  use_superglue_loss: true
 
 
 augmentation:
@@ -173,7 +174,7 @@ system:
 
 storage:
   # Custom storage directories
-  checkpoint_dir: "/fs/pool/pool-mlsb/bulat/Wormologist/checkpoint_three_cell_types_one_to_one_sliced_data"  # modify for each experiment
-  wandb_dir: "/fs/pool/pool-mlsb/bulat/Wormologist/wandb_three_cell_types_one_to_one_sliced_data"  # modify for each experiment
+  checkpoint_dir: "/fs/pool/pool-mlsb/bulat/Wormologist/model_checkpoints/checkpoint_three_cell_types_one_to_one_random_data_superglue_loss_fixed5"  # modify for each experiment
+  wandb_dir: "/fs/pool/pool-mlsb/bulat/Wormologist/wandb_three_cell_types_one_to_one_random_data_superglue_loss_fixed5"  # modify for each experiment
   use_experiment_subdir: true  # Create subdirectory with experiment name
   save_config_copy: true  # Save a copy of the config with checkpoints

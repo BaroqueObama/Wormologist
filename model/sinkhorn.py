@@ -321,49 +321,6 @@ class AssignmentLoss(nn.Module):
         P_scaled = full_P * scale
         log_P = (P_scaled.clamp_min(eps)).log()
 
-        # Debugging
-        
-        with torch.no_grad():
-            b = 0  # pick a batch element to inspect
-            if B > 0:
-                P_b = P_scaled[b]              # [N+1, C+1]
-                row_sums = P_b.sum(dim=-1)     # [N+1]
-                col_sums = P_b.sum(dim=-2)     # [C+1]
-                total_mass = P_b.sum()
-
-                vis = visible_mask[b].bool()   # [N]
-                N_plus = row_sums.shape[0]
-                N = N_plus - 1                 # dustbin row index
-                vis_rows = vis.nonzero(as_tuple=False).squeeze(-1)
-                nonvis_rows = (~vis).nonzero(as_tuple=False).squeeze(-1)
-
-                print("=== SuperGlue P_scaled debug ===", flush=True)
-                print("m (visible rows):", int(vis.sum().item()), flush=True)
-                print("C (real columns):", C, flush=True)
-
-                # Visible vs non-visible rows
-                if vis_rows.numel() > 0:
-                    print("visible row_sums:", row_sums[vis_rows], flush=True)
-                else:
-                    print("visible row_sums: []", flush=True)
-
-                if nonvis_rows.numel() > 0:
-                    print("non-visible row_sums:", row_sums[nonvis_rows], flush=True)
-                else:
-                    print("non-visible row_sums: []", flush=True)
-
-                print("dustbin row_sum:", row_sums[N], flush=True)
-
-                # Columns (first few + dustbin)
-                print("first 10 col_sums:", col_sums[:10], flush=True)
-                print("dustbin col_sum:", col_sums[C], flush=True)
-
-                # Example row values and total mass
-                print("P_scaled[0, :10]:", P_b[0, :10], flush=True)
-                print("P_scaled total_mass:", total_mass, flush=True)
-        # --- end debug block ---
-            
-
         # Two aggregation modes:
         # - worm_averaged_loss == False:
         #     element-averaged over all batches (original behavior).

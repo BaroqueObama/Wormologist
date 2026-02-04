@@ -5,7 +5,7 @@ import torch
 import pytorch_lightning as L
 from typing import Dict, Optional, Union, List, Tuple, Any
 
-from config.config import AugmentationConfig, Config
+from config.config import AugmentationConfig, Config, TaskConfig
 from loader.data_loader import create_data_loader
 from model.lightning_model import LightningModel
 import json
@@ -70,7 +70,12 @@ def load_model_from_checkpoint(checkpoint_path: str, config: Config = None, devi
             config = checkpoint['hyper_parameters']['config']
         else:
             raise ValueError("No config found in checkpoint and none provided")
-    
+        
+    # TODO: check if this is fine. I have to make the old models without TaskConfig compatible.
+    if isinstance(config, dict):
+        config = Config.from_dict(config)  # normalize old dict configs
+    if not hasattr(config, "task") or config.task is None:
+        config.task = TaskConfig()        # backward-compat default
 
     model = LightningModel(config)
     
@@ -129,8 +134,15 @@ def compute_cell_type_error_stats_for_loader(
 
             # Prepare targets as in LightningModel
             targets = model.prepare_targets(labels, batch_assignment, visible_mask)
-            logits = model(batch_device)["logits"]       # [B, N, C]
-            preds = logits.argmax(dim=-1)                # [B, N]
+
+            # Run the model and use the same Sinkhorn/SuperGlue matcher used in test_step
+            outputs = model(batch_device)  # {"logits": ...}
+            device_logits = outputs["logits"].device
+            targets["labels"] = targets["labels"].to(device_logits)
+            targets["visible_mask"] = targets["visible_mask"].to(device_logits)
+
+            loss_dict = model.loss_fn(outputs, targets)  # includes "soft_assignments"
+            preds = loss_dict["soft_assignments"].argmax(dim=-1)  # [B, N]
 
             # Move to CPU for stats
             labels_cpu = targets["labels"].cpu()
@@ -380,7 +392,8 @@ def run_subgraph_suite(
     subgraph_root: Union[str, Path],
     checkpoint_path: Union[str, Path],
     results_path: Optional[Union[str, Path]] = None,
-) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]], Dict[str, Any]]:
+    compute_cell_type_metrics: bool = False,
+) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]], Optional[Dict[str, Any]]]:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, config = load_model_from_checkpoint(checkpoint_path, device=device)
 
@@ -423,7 +436,7 @@ def run_subgraph_suite(
     results_core: Dict[str, Dict[str, float]] = {}
     results_full: Dict[str, Dict[str, float]] = {}
 
-    ct_totals_fine = _init_celltype_totals(NUM_CELL_TYPES_FINE)
+    ct_totals_fine = _init_celltype_totals(NUM_CELL_TYPES_FINE) if compute_cell_type_metrics else None
 
     for dataset_dir in _discover_subgraph_datasets(subgraph_root):
         loader = create_data_loader(
@@ -449,16 +462,17 @@ def run_subgraph_suite(
         results_core[dataset_dir.name] = filtered_metrics
         print(f"{dataset_dir.name}: {filtered_metrics}")
 
-        # Cell-type error analysis for this dataset
-        ct_stats_fine = compute_cell_type_error_stats_for_loader(
-            model, loader, device=device, cell_types=CELL_TYPES_FINE, num_cell_types=NUM_CELL_TYPES_FINE
-        )
-        if results_file is not None:
-            ct_out_path = results_file.with_name(f"{dataset_dir.name}_celltype_errors.json")
-            with ct_out_path.open("w") as handle:
-                json.dump(ct_stats_fine, handle, indent=2)
+         # Cell-type error analysis for this dataset
+        if compute_cell_type_metrics:
+            ct_stats_fine = compute_cell_type_error_stats_for_loader(
+                model, loader, device=device, cell_types=CELL_TYPES_FINE, num_cell_types=NUM_CELL_TYPES_FINE
+            )
+            if results_file is not None:
+                ct_out_path = results_file.with_name(f"{dataset_dir.name}_celltype_errors.json")
+                with ct_out_path.open("w") as handle:
+                    json.dump(ct_stats_fine, handle, indent=2)
 
-        _accumulate_celltype_totals(ct_totals_fine, ct_stats_fine)
+            _accumulate_celltype_totals(ct_totals_fine, ct_stats_fine)
 
         if results_file is not None:
             core_path = results_file.with_name(f"{results_file.stem}_core{results_file.suffix}")
@@ -479,10 +493,11 @@ def run_subgraph_suite(
         with full_summary.open("w") as h:
             json.dump(summary_full, h, indent=2)
 
-        ct_summary = _celltype_summary_from_totals(ct_totals_fine)
-        ct_summary_path = results_file.with_name("celltype_errors_summary.json")
-        with ct_summary_path.open("w") as h:
-            json.dump(ct_summary, h, indent=2)
+        if compute_cell_type_metrics and ct_totals_fine is not None:
+            ct_summary = _celltype_summary_from_totals(ct_totals_fine)
+            ct_summary_path = results_file.with_name("celltype_errors_summary.json")
+            with ct_summary_path.open("w") as h:
+                json.dump(ct_summary, h, indent=2)
 
     return results_core, results_full, ct_totals_fine
 
@@ -532,6 +547,9 @@ def _compute_unbiased_std(total_sum: float, total_sq: float, count: float) -> fl
 # Experiments Suite
 
 if __name__ == "__main__":
+
+    compute_cell_type_metrics = False
+
     parent_roots = [
         # Path("/fs/pool/pool-mlsb/bulat/Wormologist/presentation_results/real_test_set_presentation/20_slices"),
         Path("/fs/pool/pool-mlsb/bulat/Wormologist/presentation_results/real_test_set_presentation/40_slices"),
@@ -576,16 +594,20 @@ if __name__ == "__main__":
 
     experiments = [
         {
-            "checkpoint_path": Path("/fs/pool/pool-mlsb/bulat/Wormologist/model_checkpoints/checkpoint_one_to_one_old_loss_superglue_finetuned_top5/sliced_data_one_to_one_old_loss_superglue_finetune_top5/epoch=epoch=0-val_accuracy=val/accuracy=0.8853.ckpt"),
-            "results_dir_name": "superglue_loss_superglue_finetuned_top5",
+            "checkpoint_path": Path("/fs/pool/pool-mlsb/bulat/Wormologist/model_checkpoints/checkpoint_no_cell_types_one_to_one_sliced_data_superglue_loss_trainable_dustbins/no_cell_types_one_to_one_sliced_data_superglue_loss_trainable_dustbins/epoch=epoch=0-val_accuracy=val/accuracy=0.8231.ckpt"),
+            "results_dir_name": "no_cell_types_superglue_loss_trainable_dustbins_best_val_ckpt",
         },
         # {
-        #     "checkpoint_path": Path("/fs/pool/pool-mlsb/bulat/Wormologist/model_checkpoints/checkpoint_one_to_one_old_loss_superglue_finetuned_top5/sliced_data_one_to_one_old_loss_superglue_finetune_top5/epoch=epoch=0-val_accuracy=val/accuracy=0.8854-v1.ckpt"),
-        #     "results_dir_name": "old_loss_superglue_finetuned_top5",
+        #     "checkpoint_path": Path("/fs/pool/pool-mlsb/bulat/Wormologist/model_checkpoints/checkpoint_superglue_loss_superglue_finetuned_top5/superglue_loss_superglue_finetuned_top5/epoch=epoch=0-val_accuracy=val/accuracy=0.8856.ckpt"),
+        #     "results_dir_name": "superglue_loss_superglue_finetuned_top5_best_val_ckpt",
         # },
         # {
-        #     "checkpoint_path": Path("/fs/pool/pool-mlsb/bulat/Wormologist/model_checkpoints/checkpoint_one_to_one_old_loss_superglue_finetuned_top5/sliced_data_one_to_one_old_loss_superglue_finetune_top5/epoch=epoch=0-val_accuracy=val/accuracy=0.8854.ckpt"),
-        #     "results_dir_name": "old_loss_superglue_finetuned_top10",
+        #     "checkpoint_path": Path("/fs/pool/pool-mlsb/bulat/Wormologist/model_checkpoints/checkpoint_one_to_one_sliced_data_superglue_finetuned_top5/one_to_one_sliced_data_superglue_finetuned_top5/epoch=epoch=0-val_accuracy=val/accuracy=0.8854.ckpt"),
+        #     "results_dir_name": "one_to_one_sliced_data_superglue_finedtuned_top5_best_val_ckpt",
+        # },
+        # {
+        #     "checkpoint_path": Path("/fs/pool/pool-mlsb/bulat/Wormologist/model_checkpoints/checkpoint_one_to_one_sliced_data_superglue_finetuned_top10/one_to_one_sliced_data_superglue_finetuned_top10/epoch=epoch=0-val_accuracy=val/accuracy=0.8859.ckpt"),
+        #     "results_dir_name": "one_to_one_sliced_data_superglue_finedtuned_top10_best_val_ckpt",
         # }
     ]
 
@@ -600,7 +622,7 @@ if __name__ == "__main__":
 
             all_results_core: Dict[str, Dict[str, float]] = {}
             all_results_full: Dict[str, Dict[str, float]] = {}
-            overall_ct_totals = _init_celltype_totals(NUM_CELL_TYPES_FINE)
+            overall_ct_totals = _init_celltype_totals(NUM_CELL_TYPES_FINE) if compute_cell_type_metrics else None
 
             for subgraph_dir in sorted(parent_root.iterdir()):
                 if not subgraph_dir.is_dir():
@@ -621,6 +643,7 @@ if __name__ == "__main__":
                     subgraph_root=subgraph_dir,
                     checkpoint_path=checkpoint_path,
                     results_path=results_path,
+                    compute_cell_type_metrics=compute_cell_type_metrics,
                 )
 
                 for dataset_name, metrics in suite_core.items():
@@ -628,7 +651,8 @@ if __name__ == "__main__":
                 for dataset_name, metrics in suite_full.items():
                     all_results_full[f"{subgraph_dir.name}/{dataset_name}"] = metrics
 
-                _accumulate_celltype_totals(overall_ct_totals, _celltype_summary_from_totals(suite_ct_totals))
+                if compute_cell_type_metrics and suite_ct_totals is not None:
+                    _accumulate_celltype_totals(overall_ct_totals, _celltype_summary_from_totals(suite_ct_totals))
 
             if all_results_core:
                 overall_dir = parent_root / results_dir_name
@@ -645,6 +669,7 @@ if __name__ == "__main__":
                 with full_path.open("w") as handle:
                     json.dump(full_summary, handle, indent=2)
 
-                overall_ct_summary = _celltype_summary_from_totals(overall_ct_totals)
-                with (overall_dir / "overall_celltype_errors_summary.json").open("w") as handle:
-                    json.dump(overall_ct_summary, handle, indent=2)
+                if compute_cell_type_metrics and overall_ct_totals is not None:
+                    overall_ct_summary = _celltype_summary_from_totals(overall_ct_totals)
+                    with (overall_dir / "overall_celltype_errors_summary.json").open("w") as handle:
+                        json.dump(overall_ct_summary, handle, indent=2)
